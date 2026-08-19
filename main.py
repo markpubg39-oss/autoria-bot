@@ -10,7 +10,7 @@ import aiohttp
 import asyncpg
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
@@ -32,7 +32,7 @@ if DATABASE_URL.startswith("postgres://"):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Повні браузерні заголовки для обходу блокувань
+# Реалістичні заголовки для обходу захисту Auto.ria
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -106,8 +106,6 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
             cars = []
             
             sections = soup.find_all("section", class_="ticket-item")
-            if not sections:
-                logging.info("Парсер не знайшов жодного 'ticket-item'")
 
             for section in sections:
                 car_id = section.get("data-id") or section.get("data-good-id")
@@ -196,7 +194,7 @@ async def add_filter(msg: types.Message):
                 user_id, url
             )
 
-        # Прогрів теми: записуємо вже існуючі авто, щоб не спамити ними
+        # Прогрів: запам'ятовуємо старі машини
         async with aiohttp.ClientSession() as session:
             current_cars = await parse_autoria(session, url)
             if current_cars:
