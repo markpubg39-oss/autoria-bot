@@ -18,7 +18,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 100.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
 # === РОБОТА З БАЗОЮ ДАНИХ ===
