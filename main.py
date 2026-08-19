@@ -2,7 +2,7 @@ import asyncio
 import html
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -47,7 +47,7 @@ HEADERS = {
 
 db_pool: Optional[asyncpg.Pool] = None
 
-# === ХЕЛПЕРИ ТА БАЗА ДАНИХ ===
+# === БАЗА ДАНИХ ТА ІНІЦІАЛІЗАЦІЯ ===
 def normalize_autoria_url(raw_url: str) -> str:
     try:
         parsed = urlparse(raw_url)
@@ -64,6 +64,12 @@ async def init_db():
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     async with db_pool.acquire() as conn:
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                subscription_expires TIMESTAMP
+            );
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_cars (
                 user_id BIGINT, 
                 car_id TEXT, 
@@ -79,13 +85,22 @@ async def init_db():
             );
         """)
 
-async def safe_send_message(user_id: int, text: str) -> bool:
+async def check_subscription(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    async with db_pool.acquire() as conn:
+        expires = await conn.fetchval("SELECT subscription_expires FROM users WHERE user_id = $1", user_id)
+    if not expires:
+        return False
+    return expires > datetime.now()
+
+async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
     try:
-        await bot.send_message(user_id, text, parse_mode="HTML")
+        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
         return True
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        return await safe_send_message(user_id, text)
+        return await safe_send_message(user_id, text, reply_markup)
     except TelegramForbiddenError:
         logging.info(f"Користувач {user_id} заблокував бота")
         return False
@@ -98,20 +113,16 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     try:
         async with session.get(url, headers=HEADERS, timeout=15) as resp:
             if resp.status != 200:
-                logging.warning(f"Auto.ria повернув статус {resp.status}")
                 return []
-            
             html_text = await resp.text()
             soup = BeautifulSoup(html_text, "html.parser")
             cars = []
-            
             sections = soup.find_all("section", class_="ticket-item")
 
             for section in sections:
                 car_id = section.get("data-id") or section.get("data-good-id")
                 if not car_id: 
                     continue
-                
                 title_elem = section.find("a", class_="address")
                 price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket")
                 
@@ -134,7 +145,8 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📁 Мої фільтри"), KeyboardButton(text="➕ Додати посилання")]
+            [KeyboardButton(text="📁 Мої фільтри"), KeyboardButton(text="➕ Додати посилання")],
+            [KeyboardButton(text="💎 Статус підписки"), KeyboardButton(text="📞 Зв'язатися з адміном")]
         ],
         resize_keyboard=True
     )
@@ -142,15 +154,62 @@ def get_main_keyboard():
 # === ОБРОБНИКИ ТЕЛЕГРАМ ===
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, subscription_expires) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+            msg.from_user.id, datetime.now() + timedelta(days=1)  # Тобі бонус 1 день або безкоштовний старт
+        )
+    
     await msg.answer(
-        "👋 **Вітаю! Я бот для моніторингу Auto.ria.**\n\n"
-        "Надішли мені посилання на пошук з Auto.ria, і я буду сповіщати про нові авто в реальному часі!",
+        "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
+        "Надішли мені посилання на пошук з Auto.ria, і я миттєво сповіщатиму тебе про нові оголошення!",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
 
+@dp.message(F.text == "💎 Статус підписки")
+async def subscription_status(msg: types.Message):
+    user_id = msg.from_user.id
+    if user_id == ADMIN_ID:
+        await msg.answer("👑 **Статус:** Адміністратор (повний доступ без обмежень)", parse_mode="Markdown")
+        return
+
+    async with db_pool.acquire() as conn:
+        expires = await conn.fetchval("SELECT subscription_expires FROM users WHERE user_id = $1", user_id)
+
+    if expires and expires > datetime.now():
+        date_str = expires.strftime("%Y-%m-%d %H:%M")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Продовжити підписку", callback_data="buy_sub")]
+        ])
+        await msg.answer(f"✅ **Підписка активна!**\nДіє до: `{date_str}`", reply_markup=kb, parse_mode="Markdown")
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Купити підписку", callback_data="buy_sub")]
+        ])
+        await msg.answer("❌ **Підписка закінчилася або відсутня.**\nДля роботи бота придбайте доступ.", reply_markup=kb, parse_mode="Markdown")
+
+@dp.message(F.text == "📞 Зв'язатися з адміном")
+async def contact_admin(msg: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Написати адміну", url=f"https://t.me/{ADMIN_USERNAME}")]
+    ])
+    await msg.answer("💬 Потрібна допомога, хочете купити підписку чи є питання? Звертайтеся напряму до адміністратора:", reply_markup=kb)
+
+@dp.callback_query(F.data == "buy_sub")
+async def buy_subscription_callback(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Написати адміну для оплати", url=f"https://t.me/{ADMIN_USERNAME}")]
+    ])
+    await call.message.answer("💎 **Оплата підписки:**\n\nЗв'яжіться з адміністратором для отримання реквізитів та активації доступу.", reply_markup=kb, parse_mode="Markdown")
+    await call.answer()
+
 @dp.message(F.text == "📁 Мої фільтри")
 async def show_filters(msg: types.Message):
+    if not await check_subscription(msg.from_user.id):
+        await msg.answer("❌ Необхідна активна підписка для перегляду фільтрів! Натисніть «💎 Статус підписки».")
+        return
+
     async with db_pool.acquire() as conn:
         filters = await conn.fetch("SELECT id, url FROM user_filters WHERE user_id = $1", msg.from_user.id)
     
@@ -175,17 +234,31 @@ async def delete_filter(call: types.CallbackQuery):
 
 @dp.message(F.text == "➕ Додати посилання")
 async def add_prompt(msg: types.Message):
+    if not await check_subscription(msg.from_user.id):
+        await msg.answer("❌ Необхідна активна підписка для додавання фільтрів! Натисніть «💎 Статус підписки».")
+        return
     await msg.answer("Надішліть скопійоване посилання з результатами пошуку Auto.ria сюди у чат.")
 
-@dp.message(F.text.startswith("http"))
+@dp.message(F.text.regexp(r"https?://[^\s]+"))
 async def add_filter(msg: types.Message):
+    if not await check_subscription(msg.from_user.id):
+        await msg.answer("❌ Необхідна активна підписка! Оформіть її через меню «💎 Статус підписки».")
+        return
+
     raw_url = msg.text.strip()
     if "auto.ria.com" not in raw_url:
         await msg.answer("❌ Посилання має бути саме з сайту `auto.ria.com`!", parse_mode="Markdown")
         return
 
+    for word in raw_url.split():
+        if word.startswith("http"):
+            raw_url = word
+            break
+
     url = normalize_autoria_url(raw_url)
     user_id = msg.from_user.id
+
+    processing_msg = await msg.answer("⏳ Обробляю посилання та налаштовую фільтр...")
 
     try:
         async with db_pool.acquire() as conn:
@@ -194,7 +267,6 @@ async def add_filter(msg: types.Message):
                 user_id, url
             )
 
-        # Прогрів: запам'ятовуємо старі машини
         async with aiohttp.ClientSession() as session:
             current_cars = await parse_autoria(session, url)
             if current_cars:
@@ -205,10 +277,37 @@ async def add_filter(msg: types.Message):
                         records
                     )
 
-        await msg.answer("✅ **Фільтр успішно додано!**\nПоточні авто збережено. Сповіщення прийдуть тільки на **нові** оголошення.", parse_mode="Markdown")
+        await processing_msg.edit_text(
+            "✅ **Фільтр успішно додано!**\nПоточні авто збережено. Сповіщення прийдуть тільки на **нові** оголошення.",
+            parse_mode="Markdown"
+        )
     except Exception as e:
         logging.error(f"Помилка додавання фільтра: {e}")
-        await msg.answer("❌ Сталася помилка при збереженні посилання.")
+        await processing_msg.edit_text("❌ Сталася помилка при збереженні посилання.")
+
+# === АДМІНСЬКІ КОМАНДИ ДЛЯ ВИДАЧІ ПІДПИСОК ===
+@dp.message(Command("grant"))
+async def grant_subscription(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    
+    args = msg.text.split()
+    if len(args) < 3:
+        await msg.answer("Формат: `/grant user_id days`", parse_mode="Markdown")
+        return
+    
+    target_user_id = int(args[1])
+    days = int(args[2])
+    new_expire = datetime.now() + timedelta(days=days)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (user_id, subscription_expires) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET subscription_expires = $2
+        """, target_user_id, new_expire)
+
+    await msg.answer(f"✅ Успішно видано підписку користувачу `{target_user_id}` на {days} днів!", parse_mode="Markdown")
+    await safe_send_message(target_user_id, f"🎉 Вам активовано/продовжено підписку на {days} днів!")
 
 # === ЦИКЛ МОНІТОРИНГУ ===
 async def monitor():
@@ -221,6 +320,11 @@ async def monitor():
                 async with aiohttp.ClientSession() as session:
                     for f in filters:
                         user_id = f["user_id"]
+                        
+                        # Перевіряємо підписку перед кожним скануванням
+                        if not await check_subscription(user_id):
+                            continue
+
                         url = f["url"]
                         cars = await parse_autoria(session, url)
 
@@ -261,7 +365,7 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     await init_db()
     asyncio.create_task(monitor())
-    logging.info("Бот готовий до роботи!")
+    logging.info("Бот повністю готовий і запущений з підписками!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
