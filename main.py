@@ -113,6 +113,7 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     try:
         async with session.get(url, headers=HEADERS, timeout=15) as resp:
             if resp.status != 200:
+                logging.warning(f"Auto.ria повернув статус {resp.status} для URL: {url}")
                 return []
             html_text = await resp.text()
             soup = BeautifulSoup(html_text, "html.parser")
@@ -239,21 +240,26 @@ async def add_prompt(msg: types.Message):
         return
     await msg.answer("Надішліть скопійоване посилання з результатами пошуку Auto.ria сюди у чат.")
 
-@dp.message(F.text.regexp(r"https?://[^\s]+"))
+@dp.message(F.text.regexp(r"https?://[^\s]+") | F.caption.regexp(r"https?://[^\s]+"))
 async def add_filter(msg: types.Message):
     if not await check_subscription(msg.from_user.id):
         await msg.answer("❌ Необхідна активна підписка! Оформіть її через меню «💎 Статус підписки».")
         return
 
-    raw_url = msg.text.strip()
-    if "auto.ria.com" not in raw_url:
+    text_content = msg.text or msg.caption or ""
+    if "auto.ria.com" not in text_content:
         await msg.answer("❌ Посилання має бути саме з сайту `auto.ria.com`!", parse_mode="Markdown")
         return
 
-    for word in raw_url.split():
+    raw_url = ""
+    for word in text_content.split():
         if word.startswith("http"):
             raw_url = word
             break
+
+    if not raw_url:
+        await msg.answer("❌ Не вдалося знайти посилання в повідомленні.")
+        return
 
     url = normalize_autoria_url(raw_url)
     user_id = msg.from_user.id
