@@ -37,15 +37,22 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "max-age=0",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1"
+    "Sec-Fetch-User": "?1",
+    "Connection": "keep-alive",
 }
 
 db_pool: Optional[asyncpg.Pool] = None
+# ОДНА спільна HTTP-сесія з cookie jar на весь час роботи бота.
+# Це важливо: постійні кукі виглядають для антибот-захисту набагато
+# "живішими", ніж свіжа сесія без жодної історії на кожен запит.
+http_session: Optional[aiohttp.ClientSession] = None
+
 
 # === БАЗА ДАНИХ ТА ІНІЦІАЛІЗАЦІЯ ===
 def normalize_autoria_url(raw_url: str) -> str:
@@ -58,6 +65,7 @@ def normalize_autoria_url(raw_url: str) -> str:
     except Exception as e:
         logging.error(f"Помилка нормалізації URL: {e}")
         return raw_url
+
 
 async def init_db():
     global db_pool
@@ -85,6 +93,7 @@ async def init_db():
             );
         """)
 
+
 async def check_subscription(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
@@ -93,6 +102,7 @@ async def check_subscription(user_id: int) -> bool:
     if not expires:
         return False
     return expires > datetime.now()
+
 
 async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
     try:
@@ -108,39 +118,71 @@ async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
         logging.error(f"Помилка відправки для {user_id}: {e}")
         return False
 
+
 # === ПАРСИНГ AUTO.RIA ===
 async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     try:
-        async with session.get(url, headers=HEADERS, timeout=15) as resp:
-            if resp.status != 200:
-                logging.warning(f"Auto.ria повернув статус {resp.status} для URL: {url}")
-                return []
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
             html_text = await resp.text()
+
+            if resp.status != 200:
+                # Раніше тут просто мовчки повертався []. Тепер логуємо статус
+                # і шматок тіла відповіді — це майже завжди 403/капча/rate-limit.
+                logging.warning(
+                    f"Auto.ria повернув статус {resp.status} для {url}. "
+                    f"Перші 300 симв. відповіді: {html_text[:300]!r}"
+                )
+                return []
+
             soup = BeautifulSoup(html_text, "html.parser")
-            cars = []
+
             sections = soup.find_all("section", class_="ticket-item")
+            if not sections:
+                # Запасний варіант, якщо auto.ria змінили верстку карток
+                sections = soup.select('section.ticket-item, div[data-marker="list-item"]')
 
+            logging.info(
+                f"Парсинг {url}: статус={resp.status}, довжина HTML={len(html_text)}, "
+                f"знайдено блоків={len(sections)}"
+            )
+
+            if not sections:
+                # 0 оголошень при статусі 200 і непорожньому HTML — це НЕ "нема авто",
+                # а скоріш за все зміна верстки сайту або антибот-сторінка (капча/challenge).
+                logging.warning(
+                    f"0 оголошень для {url}, хоча статус 200. Схоже на блокування/капчу "
+                    f"або зміну верстки. Сніппет: {html_text[:500]!r}"
+                )
+
+            cars = []
             for section in sections:
-                car_id = section.get("data-id") or section.get("data-good-id")
-                if not car_id: 
-                    continue
-                title_elem = section.find("a", class_="address")
-                price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket")
-                
-                title = title_elem.text.strip() if title_elem else "Автомобіль"
-                price = price_elem.text.strip() if price_elem else "Ціну не вказано"
-                link = title_elem.get("href") if title_elem else ""
+                try:
+                    car_id = section.get("data-id") or section.get("data-good-id")
+                    if not car_id:
+                        continue
+                    title_elem = section.find("a", class_="address")
+                    price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket")
 
-                cars.append({
-                    "car_id": str(car_id), 
-                    "title": title, 
-                    "price": price,
-                    "link": link
-                })
+                    title = title_elem.text.strip() if title_elem else "Автомобіль"
+                    price = price_elem.text.strip() if price_elem else "Ціну не вказано"
+                    link = title_elem.get("href") if title_elem else ""
+
+                    cars.append({
+                        "car_id": str(car_id),
+                        "title": title,
+                        "price": price,
+                        "link": link
+                    })
+                except Exception as e:
+                    # Одне криве оголошення більше не валить весь парсинг сторінки
+                    logging.error(f"Помилка розбору окремого блоку оголошення: {e}")
+                    continue
+
             return cars
     except Exception as e:
         logging.error(f"Помилка парсингу {url}: {e}")
         return []
+
 
 # === КЛАВІАТУРИ ===
 def get_main_keyboard():
@@ -152,6 +194,7 @@ def get_main_keyboard():
         resize_keyboard=True
     )
 
+
 # === ОБРОБНИКИ ТЕЛЕГРАМ ===
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -160,13 +203,14 @@ async def start(msg: types.Message):
             "INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
             msg.from_user.id, datetime.now() + timedelta(days=1)
         )
-    
+
     await msg.answer(
         "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
         "Надішли мені посилання на пошук з Auto.ria, і я миттєво сповіщатиму тебе про нові оголошення!",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
+
 
 @dp.message(F.text == "💎 Статус підписки")
 async def subscription_status(msg: types.Message):
@@ -190,12 +234,14 @@ async def subscription_status(msg: types.Message):
         ])
         await msg.answer("❌ **Підписка закінчилася або відсутня.**\nДля роботи бота придбайте доступ.", reply_markup=kb, parse_mode="Markdown")
 
+
 @dp.message(F.text == "📞 Зв'язатися з адміном")
 async def contact_admin(msg: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Написати адміну", url=f"https://t.me/{ADMIN_USERNAME}")]
     ])
     await msg.answer("💬 Потрібна допомога, хочете купити підписку чи є питання? Звертайтеся напряму до адміністратора:", reply_markup=kb)
+
 
 @dp.callback_query(F.data == "buy_sub")
 async def buy_subscription_callback(call: types.CallbackQuery):
@@ -205,6 +251,7 @@ async def buy_subscription_callback(call: types.CallbackQuery):
     await call.message.answer("💎 **Оплата підписки:**\n\nЗв'яжіться з адміністратором для отримання реквізитів та активації доступу.", reply_markup=kb, parse_mode="Markdown")
     await call.answer()
 
+
 @dp.message(F.text == "📁 Мої фільтри")
 async def show_filters(msg: types.Message):
     if not await check_subscription(msg.from_user.id):
@@ -213,7 +260,7 @@ async def show_filters(msg: types.Message):
 
     async with db_pool.acquire() as conn:
         filters = await conn.fetch("SELECT id, url FROM user_filters WHERE user_id = $1", msg.from_user.id)
-    
+
     if not filters:
         await msg.answer("У вас немає збережених фільтрів. Натисніть «➕ Додати посилання».")
         return
@@ -225,6 +272,7 @@ async def show_filters(msg: types.Message):
         ])
         await msg.answer(f"🔗 `{html.escape(f['url'])}`", reply_markup=kb, parse_mode="HTML")
 
+
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_filter(call: types.CallbackQuery):
     filter_id = int(call.data.split("_")[1])
@@ -233,12 +281,14 @@ async def delete_filter(call: types.CallbackQuery):
     await call.answer("Фільтр видалено!", show_alert=True)
     await call.message.delete()
 
+
 @dp.message(F.text == "➕ Додати посилання")
 async def add_prompt(msg: types.Message):
     if not await check_subscription(msg.from_user.id):
         await msg.answer("❌ Необхідна активна підписка для додавання фільтрів! Натисніть «💎 Статус підписки».")
         return
     await msg.answer("Надішліть скопійоване посилання з результатами пошуку Auto.ria сюди у чат.")
+
 
 @dp.message(F.text.regexp(r"https?://[^\s]+") | F.caption.regexp(r"https?://[^\s]+"))
 async def add_filter(msg: types.Message):
@@ -273,35 +323,48 @@ async def add_filter(msg: types.Message):
                 user_id, url
             )
 
-        async with aiohttp.ClientSession() as session:
-            current_cars = await parse_autoria(session, url)
-            if current_cars:
-                records = [(user_id, c["car_id"]) for c in current_cars]
-                async with db_pool.acquire() as conn:
-                    await conn.executemany(
-                        "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                        records
-                    )
+        current_cars = await parse_autoria(http_session, url)
+        if current_cars:
+            records = [(user_id, c["car_id"]) for c in current_cars]
+            async with db_pool.acquire() as conn:
+                await conn.executemany(
+                    "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    records
+                )
 
-        await processing_msg.edit_text(
-            "✅ **Фільтр успішно додано!**\nПоточні авто збережено. Сповіщення прийдуть тільки на **нові** оголошення.",
-            parse_mode="Markdown"
-        )
+        if current_cars:
+            await processing_msg.edit_text(
+                "✅ **Посилання успішно збережено в базі даних!**\n"
+                f"Поточні оголошення зафіксовано: <b>{len(current_cars)}</b> шт.\n"
+                "Сповіщення прийдуть тільки на <b>нові</b> оголошення.",
+                parse_mode="HTML"
+            )
+        else:
+            # 0 знайдених авто одразу видно користувачу — не треба лізти в логи,
+            # щоб зрозуміти, що парсер щось не знаходить.
+            await processing_msg.edit_text(
+                "⚠️ **Посилання збережено, але зараз по ньому знайдено 0 оголошень.**\n"
+                "Або по фільтру справді немає авто, або сайт тимчасово заблокував запит "
+                "(антибот-захист/капча). Спробуйте команду /debug з цим посиланням трохи пізніше, "
+                "щоб перевірити.",
+                parse_mode="HTML"
+            )
     except Exception as e:
         logging.error(f"Помилка додавання фільтра: {e}")
         await processing_msg.edit_text("❌ Сталася помилка при збереженні посилання.")
 
-# === АДМІНСЬКІ КОМАНДИ ДЛЯ ВИДАЧІ ПІДПИСОК ===
+
+# === АДМІНСЬКІ КОМАНДИ ===
 @dp.message(Command("grant"))
 async def grant_subscription(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-    
+
     args = msg.text.split()
     if len(args) < 3:
         await msg.answer("Формат: `/grant user_id days`", parse_mode="Markdown")
         return
-    
+
     target_user_id = int(args[1])
     days = int(args[2])
     new_expire = datetime.now() + timedelta(days=days)
@@ -315,6 +378,41 @@ async def grant_subscription(msg: types.Message):
     await msg.answer(f"✅ Успішно видано підписку користувачу `{target_user_id}` на {days} днів!", parse_mode="Markdown")
     await safe_send_message(target_user_id, f"🎉 Вам активовано/продовжено підписку на {days} днів!")
 
+
+@dp.message(Command("debug"))
+async def debug_parse(msg: types.Message):
+    """
+    Тільки для адміна. Дозволяє протестувати парсинг конкретного посилання
+    прямо з Telegram, без перезапуску сервера і без копання в логах.
+    Використання: /debug https://auto.ria.com/uk/search/?...
+    """
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().startswith("http"):
+        await msg.answer("Формат: `/debug <посилання>`", parse_mode="Markdown")
+        return
+
+    raw_url = parts[1].strip()
+    url = normalize_autoria_url(raw_url)
+
+    wait_msg = await msg.answer(f"⏳ Перевіряю:\n`{html.escape(url)}`", parse_mode="Markdown")
+    cars = await parse_autoria(http_session, url)
+
+    if cars:
+        preview = "\n".join(f"• {c['title']} — {c['price']}" for c in cars[:5])
+        await wait_msg.edit_text(
+            f"✅ Знайдено оголошень: <b>{len(cars)}</b>\n\nПерші кілька:\n{html.escape(preview)}",
+            parse_mode="HTML"
+        )
+    else:
+        await wait_msg.edit_text(
+            "⚠️ Знайдено 0 оголошень. Дивись логи бота (там я пишу статус-код і шматок HTML) — "
+            "це або антибот-захист/капча, або верстка сторінки змінилась.",
+        )
+
+
 # === ЦИКЛ МОНІТОРИНГУ ===
 async def monitor():
     while True:
@@ -322,56 +420,61 @@ async def monitor():
             async with db_pool.acquire() as conn:
                 filters = await conn.fetch("SELECT user_id, url FROM user_filters")
 
-            if filters:
-                async with aiohttp.ClientSession() as session:
-                    for f in filters:
-                        user_id = f["user_id"]
-                        
-                        if not await check_subscription(user_id):
-                            continue
+            for f in filters:
+                user_id = f["user_id"]
 
-                        url = f["url"]
-                        cars = await parse_autoria(session, url)
+                if not await check_subscription(user_id):
+                    continue
 
-                        for car in cars:
+                url = f["url"]
+                cars = await parse_autoria(http_session, url)
+
+                for car in cars:
+                    async with db_pool.acquire() as conn:
+                        already_sent = await conn.fetchval(
+                            "SELECT 1 FROM sent_cars WHERE user_id = $1 AND car_id = $2",
+                            user_id, car["car_id"]
+                        )
+
+                    if not already_sent:
+                        safe_title = html.escape(car["title"])
+                        safe_price = html.escape(car["price"])
+                        safe_link = html.escape(car["link"], quote=True)
+
+                        msg_text = (
+                            f"🚗 <b>Нове оголошення!</b>\n\n"
+                            f"📌 <b>{safe_title}</b>\n"
+                            f"💰 <b>Ціна:</b> {safe_price}\n\n"
+                            f'🔗 <a href="{safe_link}">Переглянути на Auto.ria</a>'
+                        )
+
+                        sent_ok = await safe_send_message(user_id, msg_text)
+                        if sent_ok:
                             async with db_pool.acquire() as conn:
-                                already_sent = await conn.fetchval(
-                                    "SELECT 1 FROM sent_cars WHERE user_id = $1 AND car_id = $2",
+                                await conn.execute(
+                                    "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                                     user_id, car["car_id"]
                                 )
-
-                            if not already_sent:
-                                safe_title = html.escape(car["title"])
-                                safe_price = html.escape(car["price"])
-                                safe_link = html.escape(car["link"], quote=True)
-                                
-                                msg_text = (
-                                    f"🚗 <b>Нове оголошення!</b>\n\n"
-                                    f"📌 <b>{safe_title}</b>\n"
-                                    f"💰 <b>Ціна:</b> {safe_price}\n\n"
-                                    f'🔗 <a href="{safe_link}">Переглянути на Auto.ria</a>'
-                                )
-
-                                sent_ok = await safe_send_message(user_id, msg_text)
-                                if sent_ok:
-                                    async with db_pool.acquire() as conn:
-                                        await conn.execute(
-                                            "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                                            user_id, car["car_id"]
-                                        )
-                                await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.5)
 
         except Exception as e:
             logging.error(f"Помилка у циклі моніторингу: {e}")
 
         await asyncio.sleep(60)
 
+
 async def main():
+    global http_session
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     await init_db()
-    asyncio.create_task(monitor())
-    logging.info("Бот повністю запущений і працює!")
-    await dp.start_polling(bot)
+    http_session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+    try:
+        asyncio.create_task(monitor())
+        logging.info("Бот повністю запущений і працює!")
+        await dp.start_polling(bot)
+    finally:
+        await http_session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
