@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # === ОСНОВНІ НАЛАШТУВАННЯ ===
-BOT_TOKEN = "8929265743:AAEoHONTPUt8Lniw0lnX7DcVJGfy0GjNSrU"
+BOT_TOKEN = "8929265743:AAEJlKtxA_ObKyZKcdMWAhgf83oMfGcaxx8"
 ADMIN_ID = 5482150373  # Твій Telegram ID
 ADMIN_USERNAME = "Primeza777"  # Твій юзернейм в TG
 
