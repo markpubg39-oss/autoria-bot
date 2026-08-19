@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, WebhookRequest
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # === НАЛАШТУВАННЯ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,9 +30,7 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Для Render обов'язково потрібен PORT
 PORT = int(os.getenv("PORT", "10000"))
-# URL твого сервісу на Render (наприклад, https://autoria-bot.onrender.com)
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 bot = Bot(token=BOT_TOKEN)
@@ -311,13 +309,12 @@ async def main():
     await init_db()
     http_session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
 
-    # Налаштування вебхука для Render
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
         await bot.set_webhook(webhook_url)
-        logging.info(ф"Вебхук встановлено на: {webhook_url}")
+        logging.info(f"Вебхук встановлено на: {webhook_url}")
     else:
-        logging.warning("RENDER_EXTERNAL_URL не вказано! Вебхук може не працювати автоматично.")
+        logging.warning("RENDER_EXTERNAL_URL не вказано!")
 
     app = web.Application()
     app.router.add_post("/webhook", handle_webhook)
@@ -330,7 +327,6 @@ async def main():
     await site.start()
     logging.info(f"Веб-сервер запущено на порту {PORT}")
 
-    # Тримаємо додаток живим
     await asyncio.Event().wait()
 
 
