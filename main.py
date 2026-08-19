@@ -32,17 +32,19 @@ if DATABASE_URL.startswith("postgres://"):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Оновлені заголовки під виглядом реального браузера Chrome на Windows
+# Оновлені заголовки з правильним Host та Referer для обходу захисту Auto.ria
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate, br",
+    "Host": "auto.ria.com",
+    "Referer": "https://auto.ria.com/uk/",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-User": "?1",
     "Cache-Control": "max-age=0"
 }
@@ -119,7 +121,6 @@ async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
 # === ПАРСИНГ AUTO.RIA ===
 async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     try:
-        # Робимо запит із заголовками та збереженням кукі
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
             html_text = await resp.text()
 
@@ -129,24 +130,19 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
             soup = BeautifulSoup(html_text, "html.parser")
             
-            # Шукаємо оголошення за різними можливими селекторами верстки Auto.ria
+            # Універсальний пошук карток оголошень
             sections = soup.find_all("section", class_="ticket-item")
             if not sections:
                 sections = soup.select('div.ticket-item, div[data-ftid="item"], div.search-result-item')
 
-            logging.info(f"Парсинг {url}: статус={resp.status}, довжина HTML={len(html_text)}, знайдено карток={len(sections)}")
-
             cars = []
             for section in sections:
                 try:
-                    # Витягуємо ID оголошення
                     car_id = section.get("data-id") or section.get("data-good-id")
                     if not car_id:
-                        # Шукаємо всередині блоку, якщо атрибут на самому тезі відсутній
                         link_elem = section.find("a", class_="address") or section.find("a", href=True)
                         if link_elem and "auto.ria.com" in link_elem.get("href", ""):
                             href = link_elem.get("href")
-                            # Витягуємо цифри з посилання як унікальний ID авто
                             parts = href.split("_")
                             if parts:
                                 car_id = ''.join(filter(str.isdigit, parts[-1]))
@@ -170,7 +166,7 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
                         "link": link
                     })
                 except Exception as e:
-                    logging.error(f"Помилка розбору окремої картки авто: {e}")
+                    logging.error(f"Помилка розбору картки: {e}")
                     continue
 
             return cars
