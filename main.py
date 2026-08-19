@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # === ОСНОВНІ НАЛАШТУВАННЯ ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8929265743:AAEJlKtxA_ObKyZKcdMWAhgf83oMfGcaxx8")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8929265743:AAHzDsN83KBVUg1FfPFZvfQyasTvLkWK9bk")
 ADMIN_ID = 5482150373  # Твій Telegram ID
 ADMIN_USERNAME = "Primeza777"  # Твій юзернейм в TG
 
@@ -122,7 +122,8 @@ def get_main_keyboard():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📁 Мої фільтри"), KeyboardButton(text="➕ Додати посилання")],
-            [KeyboardButton(text="ℹ️ Інформація"), KeyboardButton(text="📞 Підтримка")]
+            [KeyboardButton(text="⚙️ Налаштування"), KeyboardButton(text="ℹ️ Інформація")],
+            [KeyboardButton(text="📞 Підтримка")]
         ],
         resize_keyboard=True
     )
@@ -171,27 +172,31 @@ async def cmd_start(message: types.Message):
     
     welcome_text = (
         f"Вітаю, {user.first_name}! 👋\n\n"
-        "Радий бачити вас у нашому боті для моніторингу оголошень Auto.ria.\n\n"
-        "З моєю допомогою ви зможете отримувати найновіші пропозиції за вашими збереженими фільтрами одразу після їх появи.\n\n"
+        "⚡ **Бот для автоматичного моніторингу оголошень Auto.ria**\n\n"
+        "Я допомагаю першим дізнаватися про нові вигідні пропозиції авто на ринку.\n\n"
+        "📌 **Як розпочати:**\n"
+        "1️⃣ Налаштуйте потрібний пошук авто на сайті **Auto.ria** (марка, ціна, рік тощо).\n"
+        "2️⃣ Скопіюйте посилання з адресного рядка браузера.\n"
+        "3️⃣ Натисніть кнопку **«➕ Додати посилання»** і надішліть його сюди.\n\n"
         "Оберіть потрібну дію в меню нижче:"
     )
-    await message.answer(welcome_text, reply_markup=get_main_keyboard())
+    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @dp.message(F.text == "📁 Мої фільтри")
 async def show_filters(message: types.Message):
     filters = get_user_filters(message.from_user.id)
     if not filters:
-        await message.answer("У вас поки немає збережених фільтрів. Натисніть «➕ Додати посилання», щоб додати новий.")
+        await message.answer("У вас поки немає збережених фільтрів.\n\nНатисніть кнопку «➕ Додати посилання», щоб відстежувати нові оголошення.")
         return
     
-    await message.answer("📋 **Ваші збережені фільтри:**")
+    await message.answer("📋 **Ваші активні відстеження:**")
     for f_id, url in filters:
         inline_kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Видалити", callback_data=f"del_{f_id}")]
+                [InlineKeyboardButton(text="❌ Видалити фільтр", callback_data=f"del_{f_id}")]
             ]
         )
-        await message.answer(f"🔗 {url}", reply_markup=inline_kb)
+        await message.answer(f"🔗 `{url}`", reply_markup=inline_kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("del_"))
 async def process_delete_filter(callback: types.CallbackQuery):
@@ -202,30 +207,49 @@ async def process_delete_filter(callback: types.CallbackQuery):
 
 @dp.message(F.text == "➕ Додати посилання")
 async def add_filter_prompt(message: types.Message):
-    await message.answer("Будь ласка, надішліть посилання на відфільтрований пошук Auto.ria у наступному повідомленні.")
+    prompt_text = (
+        "🔗 **Як додати нове відстеження:**\n\n"
+        "1. Зайдіть на сайт або в додаток **Auto.ria**.\n"
+        "2. Налаштуйте всі фільтри (марка, модель, рік, ціна, область).\n"
+        "3. Скопіюйте посилання на результат пошуку.\n"
+        "4. **Надішліть це посилання сюди у відповідь.**\n\n"
+        "💡 *Приклад посилання:*\n`https://auto.ria.com/uk/search/?indexName=auto,s_app,g_app&categories.main.id=1&price.USD.lte=7000`"
+    )
+    await message.answer(prompt_text, parse_mode="Markdown")
+
+@dp.message(F.text == "⚙️ Налаштування")
+async def settings_cmd(message: types.Message):
+    settings_text = (
+        "⚙️ **Налаштування бота**\n\n"
+        "• **Інтервал перевірки:** 1 хвилина\n"
+        "• **Сповіщення:** Увімкнено 🔔\n"
+        "• **Статус бота:** Активний ✅\n\n"
+        "Щоб керувати збереженими посиланнями або видалити застарілі, скористайтеся кнопкою **«📁 Мої фільтри»**."
+    )
+    await message.answer(settings_text, parse_mode="Markdown")
 
 @dp.message(F.text.startswith("http://") | F.text.startswith("https://"))
 async def save_user_url(message: types.Message):
     url = message.text.strip()
     if "auto.ria.com" not in url:
-        await message.answer("Будь ласка, надішліть коректне посилання з сайту Auto.ria.")
+        await message.answer("❌ **Помилка!** Посилання має бути саме з сайту `auto.ria.com`.\nСпробуйте ще раз.", parse_mode="Markdown")
         return
     
     add_filter(message.from_user.id, url)
-    await message.answer("✅ Посилання успішно збережено! Тепер я відстежуватиму нові оголошення за цим фільтром.", reply_markup=get_main_keyboard())
+    await message.answer("✅ **Посилання збережено!**\n\nТепер бот перевіряє Auto.ria щохвилини та миттєво надішле нові оголошення сюди.", reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @dp.message(F.text == "ℹ️ Інформація")
 async def info_cmd(message: types.Message):
     info_text = (
-        "ℹ️ **Інформація про бота**\n\n"
-        "Цей бот автоматично перевіряє нові оголошення за вашими посиланнями з Auto.ria і миттєво сповіщає про них.\n\n"
-        "Щоб розпочати роботу, додайте посилання через кнопку «➕ Додати посилання»."
+        "ℹ️ **Про сервіс**\n\n"
+        "Бот працює в режимі 24/7 і автоматично моніторить появу нових авто за вашими критеріями.\n\n"
+        "Ви отримуєте сповіщення набагато швидше, ніж більшість покупців на сайті."
     )
-    await message.answer(info_text)
+    await message.answer(info_text, parse_mode="Markdown")
 
 @dp.message(F.text == "📞 Підтримка")
 async def support_cmd(message: types.Message):
-    await message.answer(f"З усіх питань та пропозицій звертайтеся до адміністратора: @{ADMIN_USERNAME}")
+    await message.answer(f"З усіх питань, багів чи пропозицій звертайтеся до адміністратора: @{ADMIN_USERNAME}")
 
 # === АДМІН-КОМАНДИ ===
 @dp.message(Command("admin"))
@@ -238,7 +262,7 @@ async def admin_panel(message: types.Message):
     for u_id, uname, fname, jdate in users[:20]:
         text += f"• ID: `{u_id}` | @{uname} | {fname} ({jdate})\n"
     
-    await message.answer(text)
+    await message.answer(text, parse_mode="Markdown")
 
 # === ТАСК МОНІТОРИНГУ ===
 async def check_updates_loop():
@@ -279,4 +303,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
