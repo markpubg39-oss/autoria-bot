@@ -10,7 +10,7 @@ import asyncpg
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # === ОСНОВНІ НАЛАШТУВАННЯ ===
@@ -28,11 +28,7 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Скільки секунд чекати між надісланими повідомленнями одному користувачу
-# (Telegram дозволяє ~1 msg/sec в один чат, беремо із запасом).
 SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.4"))
-
-# Раз на скільки секунд запускати повний цикл перевірки фільтрів.
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
 bot = Bot(token=BOT_TOKEN)
@@ -42,10 +38,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# Пул з'єднань з базою даних
 db_pool: Optional[asyncpg.Pool] = None
-
-# Семафор для обмеження кількості паралельних запитів до Auto.ria (захист від бана IP)
 PARALLEL_SCRAPE_LIMITER = asyncio.Semaphore(5)
 
 
@@ -111,7 +104,6 @@ async def add_filter(user_id: int, url: str) -> bool:
             VALUES ($1, $2, $3)
             ON CONFLICT (user_id, url) DO NOTHING
         """, user_id, url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        # asyncpg повертає рядок на кшталт "INSERT 0 1" (1 = вставлено) або "INSERT 0 0" (конфлікт)
         return result.endswith(" 1")
 
 
@@ -167,14 +159,12 @@ async def fetch_html(session: aiohttp.ClientSession, url: str) -> Optional[str]:
         return None
 
 
-def parse_html(html: str) -> list:
-    soup = BeautifulSoup(html, "html.parser")
+def parse_html(page_html: str) -> list:
+    soup = BeautifulSoup(page_html, "html.parser")
     cars = []
 
     sections = soup.find_all("section", class_="ticket-item")
     if not sections:
-        # Порожній результат може означати як "немає авто", так і те,
-        # що auto.ria змінили верстку — логуємо, щоб було видно проблему швидко.
         logging.info("Парсер не знайшов жодного 'ticket-item' — перевір, чи не змінилась верстка сайту")
 
     for section in sections:
@@ -201,19 +191,27 @@ def parse_html(html: str) -> list:
 
 async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     async with PARALLEL_SCRAPE_LIMITER:
-        html = await fetch_html(session, url)
-        if html is None:
+        page_html = await fetch_html(session, url)
+        if page_html is None:
             return []
         # BeautifulSoup-парсинг — синхронний і потенційно повільний,
         # тому виконуємо його в окремому потоці, щоб не тримати event loop.
-        return await asyncio.to_thread(parse_html, html)
+        return await asyncio.to_thread(parse_html, page_html)
 
 
 # === НАДІЙНА ВІДПРАВКА ПОВІДОМЛЕНЬ ===
-async def safe_send_message(user_id: int, text: str, retries: int = 3) -> Optional[bool]:
+async def safe_send_message(user_id: int, text: str, parse_mode: Optional[str] = "HTML", retries: int = 3) -> Optional[bool]:
     """
     Відправляє повідомлення з урахуванням Telegram flood control.
     При TelegramRetryAfter чекає стільки, скільки просить Telegram, і пробує ще раз.
+
+    parse_mode за замовчуванням "HTML" — підходить для повідомлень, які формує
+    сам бот (заздалегідь відомий, контрольований формат з екранованими вставками).
+    Для ДОВІЛЬНОГО тексту від людини (наприклад, /broadcast) передавай
+    parse_mode=None: інакше один випадковий символ "<" чи "&" у тексті адміна
+    зверне в TelegramBadRequest і провалить розсилку ОДНАКОВО для всіх
+    користувачів одразу, а сам адмін побачить лише суху цифру "не доставлено",
+    без жодного натяку на причину.
 
     Повертає:
       True  — повідомлення успішно доставлено;
@@ -224,7 +222,7 @@ async def safe_send_message(user_id: int, text: str, retries: int = 3) -> Option
     """
     for attempt in range(retries):
         try:
-            await bot.send_message(user_id, text, parse_mode="HTML")
+            await bot.send_message(user_id, text, parse_mode=parse_mode)
             return True
         except TelegramRetryAfter as e:
             logging.warning(f"Flood control: чекаю {e.retry_after}с перед повтором для {user_id}")
@@ -234,16 +232,13 @@ async def safe_send_message(user_id: int, text: str, retries: int = 3) -> Option
             logging.info(f"Користувач {user_id} заблокував бота, пропускаю")
             return False
         except TelegramBadRequest as e:
-            # Битий запит (наприклад, не той HTML) не полагодиться повтором —
-            # це постійна відмова саме для цього повідомлення.
+            # Битий запит (наприклад, невалідний HTML) не полагодиться повтором.
             logging.error(f"Некоректне повідомлення для {user_id}: {e}")
             return False
         except Exception as e:
-            # Мережевий/невідомий збій — може бути тимчасовим, тому не
-            # позначаємо авто відправленим і даємо шанс наступного циклу.
+            # Мережевий/невідомий збій — може бути тимчасовим.
             logging.error(f"Тимчасова помилка відправки користувачу {user_id}: {e}")
             return None
-    # Вичерпали спроби через постійні flood-control затримки — теж тимчасово.
     return None
 
 
@@ -255,17 +250,17 @@ async def cmd_start(message: types.Message):
 
     welcome_text = (
         f"Вітаю, {user.first_name}! 👋\n\n"
-        "⚡ **Бот для автоматичного моніторингу оголошень Auto.ria**\n\n"
+        "⚡ <b>Бот для автоматичного моніторингу оголошень Auto.ria</b>\n\n"
         "Я допомагаю першим дізнаватися про нові вигідні пропозиції авто на ринку.\n\n"
-        "📌 **Як розпочати роботу:**\n"
-        "1️⃣ Зайдіть на сайт **Auto.ria**.\n"
+        "📌 <b>Як розпочати роботу:</b>\n"
+        "1️⃣ Зайдіть на сайт <b>Auto.ria</b>.\n"
         "2️⃣ Вкажіть потрібні параметри (марку, ціну, рік тощо).\n"
-        "3️⃣ **Обов'язково натисніть кнопку «Пошук»**, щоб сформувати список авто.\n"
-        "4️⃣ **НЕ заходьте в окремі оголошення!** Скопіюйте посилання прямо з адресної стрічки браузера зі сторінки зі списком результатів.\n"
-        "5️⃣ Натисніть кнопку **«➕ Додати посилання»** та надішліть його сюди.\n\n"
+        "3️⃣ <b>Обов'язково натисніть кнопку «Пошук»</b>, щоб сформувати список авто.\n"
+        "4️⃣ <b>НЕ заходьте в окремі оголошення!</b> Скопіюйте посилання прямо з адресної стрічки браузера зі сторінки зі списком результатів.\n"
+        "5️⃣ Натисніть кнопку <b>«➕ Додати посилання»</b> та надішліть його сюди.\n\n"
         "Оберіть потрібну дію в меню нижче:"
     )
-    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 
 @dp.message(F.text == "📁 Мої фільтри")
@@ -275,7 +270,7 @@ async def show_filters(message: types.Message):
         await message.answer("У вас поки немає збережених фільтрів.\n\nНатисніть кнопку «➕ Додати посилання», щоб відстежувати нові оголошення.")
         return
 
-    await message.answer("📋 **Ваші активні відстеження:**")
+    await message.answer("📋 <b>Ваші активні відстеження:</b>", parse_mode="HTML")
     for row in filters:
         f_id = row["id"]
         url = row["url"]
@@ -284,7 +279,7 @@ async def show_filters(message: types.Message):
                 [InlineKeyboardButton(text="❌ Видалити фільтр", callback_data=f"del_{f_id}")]
             ]
         )
-        await message.answer(f"🔗 `{url}`", reply_markup=inline_kb, parse_mode="Markdown")
+        await message.answer(f"🔗 <code>{html.escape(url)}</code>", reply_markup=inline_kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -303,28 +298,28 @@ async def process_delete_filter(callback: types.CallbackQuery):
 @dp.message(F.text == "➕ Додати посилання")
 async def add_filter_prompt(message: types.Message):
     prompt_text = (
-        "🔗 **Детальна інструкція, як додати відстеження:**\n\n"
-        "1️⃣ Зайдіть на сайт або в додаток **Auto.ria**.\n"
+        "🔗 <b>Детальна інструкція, як додати відстеження:</b>\n\n"
+        "1️⃣ Зайдіть на сайт або в додаток <b>Auto.ria</b>.\n"
         "2️⃣ Виберіть усі потрібні параметри авто (марку, модель, рік, ціну, регіон).\n"
-        "3️⃣ **Обов'язково натисніть кнопку «Пошук»**, щоб перед вами відкрився список знайдених машин.\n"
-        "4️⃣ **УВАГА: НЕ переходьте на сторінку конкретного оголошення!** Нам потрібне посилання саме на загальний результат пошуку.\n"
+        "3️⃣ <b>Обов'язково натисніть кнопку «Пошук»</b>, щоб перед вами відкрився список знайдених машин.\n"
+        "4️⃣ <b>УВАГА: НЕ переходьте на сторінку конкретного оголошення!</b> Нам потрібне посилання саме на загальний результат пошуку.\n"
         "5️⃣ Скопіюйте посилання з адресного рядка зверху.\n"
-        "6️⃣ **Надішліть скопійоване посилання сюди у відповідь на це повідомлення.**\n\n"
-        "💡 *Приклад правильного посилання:*\n`https://auto.ria.com/uk/search/?indexName=auto,s_app,g_app&categories.main.id=1&price.USD.lte=7000`"
+        "6️⃣ <b>Надішліть скопійоване посилання сюди у відповідь на це повідомлення.</b>\n\n"
+        "💡 <i>Приклад правильного посилання:</i>\n<code>https://auto.ria.com/uk/search/?indexName=auto,s_app,g_app&categories.main.id=1&price.USD.lte=7000</code>"
     )
-    await message.answer(prompt_text, parse_mode="Markdown")
+    await message.answer(prompt_text, parse_mode="HTML")
 
 
 @dp.message(F.text == "⚙️ Налаштування")
 async def settings_cmd(message: types.Message):
     settings_text = (
-        "⚙️ **Налаштування моніторингу**\n\n"
-        f"• **Частота перевірки:** раз на {CHECK_INTERVAL_SECONDS} сек ⏱️\n"
-        "• **Сповіщення:** Миттєві 🔔\n"
-        "• **Статус сканера:** Працює 24/7 ✅\n\n"
-        "Щоб переглянути або видалити ваші збережені пошуки, скористайтеся кнопкою **«📁 Мої фільтри»**."
+        "⚙️ <b>Налаштування моніторингу</b>\n\n"
+        f"• <b>Частота перевірки:</b> раз на {CHECK_INTERVAL_SECONDS} сек ⏱️\n"
+        "• <b>Сповіщення:</b> Миттєві 🔔\n"
+        "• <b>Статус сканера:</b> Працює 24/7 ✅\n\n"
+        "Щоб переглянути або видалити ваші збережені пошуки, скористайтеся кнопкою <b>«📁 Мої фільтри»</b>."
     )
-    await message.answer(settings_text, parse_mode="Markdown")
+    await message.answer(settings_text, parse_mode="HTML")
 
 
 @dp.message(F.text.startswith("http://") | F.text.startswith("https://"))
@@ -332,11 +327,11 @@ async def save_user_url(message: types.Message):
     url = message.text.strip()
 
     if len(url) > 2000:
-        await message.answer("❌ **Помилка!** Посилання занадто довге.", parse_mode="Markdown")
+        await message.answer("❌ <b>Помилка!</b> Посилання занадто довге.", parse_mode="HTML")
         return
 
     if "auto.ria.com" not in url:
-        await message.answer("❌ **Помилка!** Посилання має бути саме з сайту `auto.ria.com`.\nСпробуйте ще раз.", parse_mode="Markdown")
+        await message.answer("❌ <b>Помилка!</b> Посилання має бути саме з сайту <code>auto.ria.com</code>.\nСпробуйте ще раз.", parse_mode="HTML")
         return
 
     user_id = message.from_user.id
@@ -350,7 +345,7 @@ async def save_user_url(message: types.Message):
 
     # "Прогріваємо" фільтр: усі авто, які вже є на сторінці ЗАРАЗ, вважаємо
     # побаченими і НЕ надсилаємо — інакше перше ж додавання виллється
-    # у шквал з 20-50 повідомлень одразу і ризикує вперлися у flood control.
+    # у шквал повідомлень і ризикує вперлося у flood control.
     try:
         async with aiohttp.ClientSession() as session:
             cars = await parse_autoria(session, url)
@@ -361,22 +356,22 @@ async def save_user_url(message: types.Message):
 
     await status_msg.delete()
     await message.answer(
-        "✅ **Посилання успішно додано!**\n\n"
+        "✅ <b>Посилання успішно додано!</b>\n\n"
         "Тепер бот перевірятиме появу нових авто за цим фільтром і миттєво надсилатиме їх сюди. "
         "Оголошення, що вже є на сторінці зараз, не надсилаються — тільки нові.",
         reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 
 @dp.message(F.text == "ℹ️ Інформація")
 async def info_cmd(message: types.Message):
     info_text = (
-        "ℹ️ **Про сервіс**\n\n"
+        "ℹ️ <b>Про сервіс</b>\n\n"
         "Бот працює у фоновому режимі без перерв і автоматично відстежує нові оголошення за вашими фільтрами.\n\n"
         "Ви дізнаєтеся про нові машини раніше за переважну більшість покупців на сайті!"
     )
-    await message.answer(info_text, parse_mode="Markdown")
+    await message.answer(info_text, parse_mode="HTML")
 
 
 @dp.message(F.text == "📞 Підтримка")
@@ -391,8 +386,8 @@ async def admin_panel(message: types.Message):
         return
 
     users = await get_all_users()
-    # username/full_name — довільний текст від користувача Telegram, може
-    # містити символи, що ламають Markdown, тому теж екрануємо через HTML.
+    # username/full_name — довільний текст від Telegram-профілю, може
+    # містити символи, що ламають HTML, тому екрануємо.
     text = f"👑 <b>Панель адміністратора</b>\n\nВсього користувачів у базі: {len(users)}\n\n"
     for row in users[:20]:
         uname = html.escape(row["username"] or "")
@@ -400,6 +395,41 @@ async def admin_panel(message: types.Message):
         text += f"• ID: <code>{row['user_id']}</code> | @{uname} | {fname} ({row['join_date']})\n"
 
     await message.answer(text, parse_mode="HTML")
+
+
+# Команда розсилки всім користувачам: /broadcast Ваш текст
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text_to_send = command.args
+    if not text_to_send:
+        await message.answer("⚠️ Вкажіть текст розсилки! Наприклад:\n<code>/broadcast Текст повідомлення...</code>", parse_mode="HTML")
+        return
+
+    users = await get_all_users()
+    await message.answer(f"🚀 Починаю розсилку для {len(users)} користувачів...")
+
+    success = 0
+    failed = 0
+
+    for row in users:
+        u_id = row["user_id"]
+        # parse_mode=None навмисно: текст розсилки — довільний ввід адміна,
+        # а не контрольований формат бота. Якщо форсувати HTML і в тексті
+        # трапиться "<" чи "&", TelegramBadRequest провалить розсилку
+        # ОДНАКОВО для всіх користувачів одразу, а адмін побачить лише
+        # суху цифру "не доставлено" без пояснення причини. Звичайний
+        # текст цю категорію збоїв повністю прибирає.
+        res = await safe_send_message(u_id, text_to_send, parse_mode=None)
+        if res is True:
+            success += 1
+        else:
+            failed += 1
+        await asyncio.sleep(SEND_DELAY_SECONDS)
+
+    await message.answer(f"✅ <b>Розсилку завершено!</b>\n\nУспішно: {success}\nНе доставлено: {failed}", parse_mode="HTML")
 
 
 # === ІЗОЛЬОВАНА ОБРОБКА ОДНОГО ФІЛЬТРУ ===
@@ -418,9 +448,8 @@ async def process_single_filter(session: aiohttp.ClientSession, user_id: int, ur
         confirmed_ids = []
 
         for car in new_cars_to_send:
-            # HTML замість Markdown: заголовки з auto.ria можуть містити
-            # символи *, _, <, > (наприклад, у назвах комплектацій) —
-            # у Markdown-режимі вони ламали парсинг (TelegramBadRequest).
+            # HTML тут навмисно лишається: це контрольований формат, який
+            # формує сам бот, а не довільний ввід людини (як у /broadcast).
             safe_title = html.escape(car["title"])
             safe_price = html.escape(car["price"])
             safe_link = html.escape(car["link"], quote=True)
