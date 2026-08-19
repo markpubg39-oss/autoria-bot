@@ -8,7 +8,6 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
 import asyncpg
-from aiohttp import web
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -29,9 +28,6 @@ if not DATABASE_URL:
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-PORT = int(os.getenv("PORT", "10000"))
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -296,43 +292,30 @@ async def monitor():
         await asyncio.sleep(60)
 
 
-async def handle_webhook(request: web.Request) -> web.Response:
-    data = await request.json()
-    update = types.Update(**data)
-    await dp.feed_update(bot, update)
-    return web.Response(text="OK")
-
-
 async def main():
     global http_session
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     await init_db()
     http_session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
 
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
-        await bot.set_webhook(webhook_url)
-        logging.info(f"Вебхук встановлено на: {webhook_url}")
-    else:
-        logging.warning("RENDER_EXTERNAL_URL не вказано!")
+    # === РЯТІВНА ЗАТРИМКА ===
+    # Даємо 15 секунд старому процесу вмерти перед запуском нового
+    logging.info("⏳ Очікування 15 секунд для завершення старих процесів Render...")
+    await asyncio.sleep(15)
 
-    app = web.Application()
-    app.router.add_post("/webhook", handle_webhook)
+    await bot.delete_webhook(drop_pending_updates=True)
 
     asyncio.create_task(monitor())
+    logging.info("✅ Бот повністю запущений і працює (через безпечний Polling)!")
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"Веб-сервер запущено на порту {PORT}")
-
-    await asyncio.Event().wait()
+    try:
+        await dp.start_polling(bot, handle_signals=True)
+    finally:
+        await http_session.close()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    finally:
-        if http_session:
-            asyncio.run(http_session.close())
+    except KeyboardInterrupt:
+        pass
