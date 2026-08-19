@@ -24,15 +24,28 @@ HEADERS = {
 def init_db():
     conn = sqlite3.connect("bot_users.db")
     cursor = conn.cursor()
+    
+    # Таблиця користувачів
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            search_url TEXT,
             expire_date TEXT,
             is_active INTEGER DEFAULT 1
         )
     """)
+    
+    # Таблиця фільтрів (мульти-посилання)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS filters (
+            filter_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            search_url TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    """)
+    
+    # Таблиця відправлених авто
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sent_cars (
             user_id INTEGER,
@@ -40,21 +53,14 @@ def init_db():
             PRIMARY KEY (user_id, car_link)
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN expire_date TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
-    except sqlite3.OperationalError:
-        pass
+    
     conn.commit()
     conn.close()
 
 def get_user(user_id):
     conn = sqlite3.connect("bot_users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, search_url, expire_date, is_active FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id, username, expire_date, is_active FROM users WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
     conn.close()
     return res
@@ -65,7 +71,7 @@ def add_or_update_user(user_id, username, days=3):
     user = get_user(user_id)
     
     if user:
-        current_expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S") if user[3] else datetime.now()
+        current_expire = datetime.strptime(user[2], "%Y-%m-%d %H:%M:%S") if user[2] else datetime.now()
         start_from = max(datetime.now(), current_expire)
         new_expire = start_from + timedelta(days=days)
         cursor.execute("UPDATE users SET expire_date = ?, is_active = 1, username = ? WHERE user_id = ?", 
@@ -86,26 +92,48 @@ def block_user(user_id):
     conn.commit()
     conn.close()
 
-def save_user_url(user_id, url):
+# === ФУНКЦІЇ МУЛЬТИ-ФІЛЬТРІВ ===
+def add_user_filter(user_id, url):
     conn = sqlite3.connect("bot_users.db")
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET search_url = ? WHERE user_id = ?", (url, user_id))
+    cursor.execute("INSERT INTO filters (user_id, search_url) VALUES (?, ?)", (user_id, url))
     conn.commit()
     conn.close()
 
-def get_active_subscribers():
+def get_user_filters(user_id):
     conn = sqlite3.connect("bot_users.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, search_url, expire_date FROM users WHERE is_active = 1 AND search_url IS NOT NULL")
-    users = cursor.fetchall()
+    cursor.execute("SELECT filter_id, search_url FROM filters WHERE user_id = ?", (user_id,))
+    res = cursor.fetchall()
+    conn.close()
+    return res
+
+def delete_user_filter(filter_id, user_id):
+    conn = sqlite3.connect("bot_users.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM filters WHERE filter_id = ? AND user_id = ?", (filter_id, user_id))
+    conn.commit()
+    conn.close()
+
+def get_all_active_filters():
+    conn = sqlite3.connect("bot_users.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT f.user_id, f.search_url 
+        FROM filters f
+        JOIN users u ON f.user_id = u.user_id
+        WHERE u.is_active = 1
+    """)
+    filters_data = cursor.fetchall()
     conn.close()
     
     active = []
     now = datetime.now()
-    for uid, url, exp_str in users:
-        if exp_str:
+    for uid, url in filters_data:
+        user = get_user(uid)
+        if user and user[2]:
             try:
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
+                exp_date = datetime.strptime(user[2], "%Y-%m-%d %H:%M:%S")
                 if exp_date > now:
                     active.append((uid, url))
             except Exception:
@@ -157,29 +185,29 @@ def fetch_cars_from_url(url):
 def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚙️ Вставити посилання з фільтром Auto.ria")],
-            [KeyboardButton(text="📊 Мій статус / Підписка"), KeyboardButton(text="💳 Купити підписку / Адмін")],
-            [KeyboardButton(text="🛑 Зупинити пошук")]
+            [KeyboardButton(text="⚙️ Додати фільтр з Auto.ria")],
+            [KeyboardButton(text="📁 Мої фільтри"), KeyboardButton(text="📊 Мій статус / Підписка")],
+            [KeyboardButton(text="💳 Придбати підписку / Адміністратор"), KeyboardButton(text="🛑 Призупинити пошук")]
         ],
         resize_keyboard=True
     )
 
 def buy_inline_keyboard():
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="💬 Написати адміну щодо підписки", url=f"https://t.me/{ADMIN_USERNAME}")]]
+        inline_keyboard=[[InlineKeyboardButton(text="💬 Зв'язатися з адміністратором", url=f"https://t.me/{ADMIN_USERNAME}")]]
     )
 
 def check_access(user_id):
     user = get_user(user_id)
-    if not user or user[4] == 0:
-        return False, "❌ **Твій доступ вимкнено або підписка закінчилася.**\nНатисни кнопку нижче, щоб написати адміну та продовжити доступ."
+    if not user or user[3] == 0:
+        return False, "❌ **Ваш доступ вимкнено або термін дії підписки закінчився.**\nНатисніть кнопку нижче, щоб зв'язатися з адміністратором для поновлення доступу."
     
-    if user[3]:
-        exp_date = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+    if user[2]:
+        exp_date = datetime.strptime(user[2], "%Y-%m-%d %H:%M:%S")
         if datetime.now() > exp_date:
-            return False, f"⚠️ **Твій тестовий період / підписка закінчилася!**\n\nЩоб купити підписку — натисни кнопку нижче."
+            return False, f"⚠️ **Термін дії вашого тестового періоду / підписки закінчився.**\n\nДля продовження доступу, будь ласка, зверніться до адміністратора."
     
-    return True, user[3]
+    return True, user[2]
 
 # === ОБРОБКА КОМАНД ===
 @dp.message(Command("start"))
@@ -190,20 +218,20 @@ async def start_cmd(message: types.Message):
     user = get_user(user_id)
     if not user:
         new_exp = add_or_update_user(user_id, username, days=3)
-        msg_text = f"👋 **Здоров! Тобі автоматично надано 3 ДНІ БЕЗКОШТОВНОГО ТЕСТУ!**\n\nПідписка активна до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`\n\n"
+        msg_text = f"Вітаємо! Вам надано **3 дні безкоштовного тестового доступу**.\n\nТермін дії підписки до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`\n\n"
         
         if user_id != ADMIN_ID:
             admin_msg = (
-                f"🚨 **НОВИЙ КОРИСТУВАЧ У БОТІ!**\n\n"
+                f"🚨 **Новий користувач у боті**\n\n"
                 f"👤 **Ім'я:** {message.from_user.first_name}\n"
-                f"🏷 **Юзернейм:** @{message.from_user.username if message.from_user.username else 'немає'}\n"
+                f"🏷 **Юзернейм:** @{message.from_user.username if message.from_user.username else 'відсутній'}\n"
                 f"🆔 **ID:** `{user_id}`\n"
-                f"⏳ **Тест до:** `{new_exp.strftime('%d.%m.%Y %H:%M')}`"
+                f"⏳ **Тестовий доступ до:** `{new_exp.strftime('%d.%m.%Y %H:%M')}`"
             )
             admin_buttons = InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="➕ 30 днів", callback_data=f"give_30_{user_id}"),
-                    InlineKeyboardButton(text="🚫 Забанити", callback_data=f"ban_{user_id}")
+                    InlineKeyboardButton(text="➕ Надати 30 днів", callback_data=f"give_30_{user_id}"),
+                    InlineKeyboardButton(text="🚫 Заблокувати", callback_data=f"ban_{user_id}")
                 ]
             ])
             try:
@@ -215,26 +243,74 @@ async def start_cmd(message: types.Message):
         if not has_access:
             await message.answer(exp_info, parse_mode="Markdown", reply_markup=buy_inline_keyboard())
             return
-        msg_text = f"👋 **Здоров! Твій доступ активний.**\n\n"
+        msg_text = f"Вітаємо! Ваш доступ до системи активний.\n\n"
 
     msg_text += (
-        "⚡️ **Як користуватися:**\n"
-        "1. Заходиш на Auto.ria, виставляєш потрібні параметри (марку, ціну, рік, місто).\n"
-        "2. Копіюєш посилання з браузера.\n"
-        "3. Тиснеш **«⚙️ Вставити посилання з фільтром Auto.ria»** і надсилаєш його сюди."
+        "📋 **Інструкція з користування:**\n"
+        "1. Перейдіть на сайт Auto.ria та налаштуйте необхідні параметри пошуку (марка, ціна, рік випуску тощо).\n"
+        "2. Скопіюйте посилання з адресного рядка браузера.\n"
+        "3. Натисніть кнопку **«⚙️ Додати фільтр з Auto.ria»** та надішліть посилання в чат.\n\n"
+        "💡 Ви можете додавати декілька фільтрів одночасно. Переглянути збережені посилання можна у розділі **«📁 Мої фільтри»**."
     )
     await message.answer(msg_text, parse_mode="Markdown", reply_markup=main_keyboard())
 
-@dp.message(F.text == "💳 Купити підписку / Адмін")
+@dp.message(F.text.in_({"⚙️ Додати фільтр з Auto.ria", "⚙️ Вставити посилання з фільтром Auto.ria"}))
+async def ask_url(message: types.Message):
+    has_access, exp_info = check_access(message.from_user.id)
+    if not has_access:
+        await message.answer(exp_info, parse_mode="Markdown", reply_markup=buy_inline_keyboard())
+        return
+    await message.answer("Будь ласка, надішліть повне посилання з сайту Auto.ria у відповідь на це повідомлення.", parse_mode="Markdown")
+
+@dp.message(F.text.startswith("https://auto.ria.com"))
+async def process_url(message: types.Message):
+    has_access, exp_info = check_access(message.from_user.id)
+    if not has_access:
+        await message.answer(exp_info, parse_mode="Markdown", reply_markup=buy_inline_keyboard())
+        return
+    
+    add_user_filter(message.from_user.id, message.text.strip())
+    await message.answer("✅ **Ваш фільтр успішно збережено.**\n\nСистема розпочала моніторинг оголошень за вказаними параметрами. Керувати збереженими фільтрами можна у розділі **«📁 Мої фільтри»**.", parse_mode="Markdown")
+
+# === ОБРОБКА «МОЇ ФІЛЬТРИ» ТА ВИДАЛЕННЯ ===
+@dp.message(F.text == "📁 Мої фільтри")
+async def show_my_filters(message: types.Message):
+    user_id = message.from_user.id
+    user_filters = get_user_filters(user_id)
+    
+    if not user_filters:
+        await message.answer("📂 **У вас немає активних фільтрів.**\n\nЩоб додати новий фільтр, скористайтесь кнопкою **«⚙️ Додати фільтр з Auto.ria»**.", parse_mode="Markdown")
+        return
+
+    await message.answer("📂 **Ваші збережені фільтри:**\nЩоб видалити потрібний фільтр, натисніть кнопку ❌ нижче відповідного посилання.")
+    
+    for filter_id, url in user_filters:
+        short_url = url[:45] + "..." if len(url) > 45 else url
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔗 Відкрити посилання", url=url),
+                InlineKeyboardButton(text="❌ Видалити", callback_data=f"del_filter_{filter_id}")
+            ]
+        ])
+        await message.answer(f"📌 **Фільтр:**\n`{short_url}`", parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("del_filter_"))
+async def delete_filter_callback(callback: types.CallbackQuery):
+    filter_id = int(callback.data.split("_")[2])
+    delete_user_filter(filter_id, callback.from_user.id)
+    await callback.message.edit_text("🗑 **Вказаний фільтр успішно видалено.**", parse_mode="Markdown")
+    await callback.answer("Видалено")
+
+@dp.message(F.text.in_({"💳 Придбати підписку / Адміністратор", "💳 Купити підписку / Адмін"}))
 async def buy_sub_button(message: types.Message):
     await message.answer(
-        "💳 **ПРИДБАННЯ ПІДПИСКИ ТА ЗВ'ЯЗОК З АДМІНОМ**\n\n"
-        "Щоб продовжити доступ до бота після тестового періоду або поставити питання — тисни кнопку нижче:",
+        "💳 **Оформлення підписки та зворотний зв'язок**\n\n"
+        "Для продовження терміну дії підписки або з будь-яких інших питань скористайтесь кнопкою нижче:",
         parse_mode="Markdown",
         reply_markup=buy_inline_keyboard()
     )
 
-@dp.callback_query()
+@dp.callback_query(F.data.startswith("give_30_") | F.data.startswith("ban_"))
 async def process_admin_callbacks(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
@@ -244,62 +320,47 @@ async def process_admin_callbacks(callback: types.CallbackQuery):
         uid = int(data.split("_")[2])
         new_exp = add_or_update_user(uid, "user", days=30)
         await callback.message.edit_text(
-            f"{callback.message.text}\n\n✅ **ОНОВЛЕНО:** Надано +30 днів (до `{new_exp.strftime('%d.%m.%Y %H:%M')}`)",
+            f"{callback.message.text}\n\n✅ **Оновлено:** Надано +30 днів доступу (до `{new_exp.strftime('%d.%m.%Y %H:%M')}`)",
             parse_mode="Markdown"
         )
         try:
-            await bot.send_message(chat_id=uid, text=f"🎉 **Твою підписку продовжено на 30 днів!**\nДіє до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`", parse_mode="Markdown")
+            await bot.send_message(chat_id=uid, text=f"🎉 **Вашу підписку успішно продовжено на 30 днів.**\nТермін дії до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`", parse_mode="Markdown")
         except:
             pass
 
     elif data.startswith("ban_"):
         uid = int(data.split("_")[1])
         block_user(uid)
-        await callback.message.edit_text(f"{callback.message.text}\n\n🚫 **ОНОВЛЕНО:** Користувача заблоковано!", parse_mode="Markdown")
+        await callback.message.edit_text(f"{callback.message.text}\n\n🚫 **Оновлено:** Користувача заблоковано.", parse_mode="Markdown")
         try:
-            await bot.send_message(chat_id=uid, text="❌ **Твій доступ до бота скасовано.**", parse_mode="Markdown")
+            await bot.send_message(chat_id=uid, text="❌ **Ваш доступ до бота було припинено.**", parse_mode="Markdown")
         except:
             pass
-
-@dp.message(F.text == "⚙️ Вставити посилання з фільтром Auto.ria")
-async def ask_url(message: types.Message):
-    has_access, exp_info = check_access(message.from_user.id)
-    if not has_access:
-        await message.answer(exp_info, parse_mode="Markdown", reply_markup=buy_inline_keyboard())
-        return
-    await message.answer("Надішли у відповідь повне посилання з Auto.ria.", parse_mode="Markdown")
-
-@dp.message(F.text.startswith("https://auto.ria.com"))
-async def process_url(message: types.Message):
-    has_access, exp_info = check_access(message.from_user.id)
-    if not has_access:
-        await message.answer(exp_info, parse_mode="Markdown", reply_markup=buy_inline_keyboard())
-        return
-    save_user_url(message.from_user.id, message.text.strip())
-    await message.answer("✅ **Фільтр збережено!** Бот вже сканує ринок під твій запит.", parse_mode="Markdown")
 
 @dp.message(F.text == "📊 Мій статус / Підписка")
 async def check_status(message: types.Message):
     user = get_user(message.from_user.id)
+    filters = get_user_filters(message.from_user.id)
     if user:
-        exp_str = user[3]
+        exp_str = user[2]
         status = "❌ Неактивна / Завершилась"
         if exp_str:
             exp_date = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S")
-            if datetime.now() < exp_date and user[4] == 1:
+            if datetime.now() < exp_date and user[3] == 1:
                 status = "✅ Активна"
         await message.answer(
-            f"📊 **Твій статус:** {status}\n"
-            f"⏳ **Підписка діє до:** `{user[3] if user[3] else 'Не обмежено'}`\n\n"
-            f"⚙️ **Твій активний URL:**\n{user[2] or 'Не вказано'}",
+            f"📊 **Інформація про підписку:**\n\n"
+            f"• Статус: {status}\n"
+            f"• Діє до: `{user[2] if user[2] else 'Не обмежено'}`\n"
+            f"• Кількість активних фільтрів: `{len(filters)}`",
             parse_mode="Markdown",
             reply_markup=buy_inline_keyboard()
         )
 
-@dp.message(F.text == "🛑 Зупинити пошук")
+@dp.message(F.text.in_({"🛑 Призупинити пошук", "🛑 Зупинити пошук"}))
 async def stop_search(message: types.Message):
     block_user(message.from_user.id)
-    await message.answer("⏸ Пошук зупинено. Твій доступ поставлено на паузу.")
+    await message.answer("⏸ Пошук призупинено. Ваш акаунт переведено в неактивний режим.")
 
 # === АДМІН-КОМАНДИ ===
 @dp.message(Command("admin"))
@@ -313,15 +374,15 @@ async def admin_panel(message: types.Message):
     users = cursor.fetchall()
     conn.close()
 
-    txt = "👑 **АДМІН-ПАНЕЛЬ**\n\n**Список користувачів:**\n"
+    txt = "👑 **Панель адміністратора**\n\n**Список користувачів:**\n"
     for uid, un, exp, act in users:
         exp_val = exp[:10] if exp else "Немає"
         txt += f"• ID: `{uid}` | @{un} | До: `{exp_val}` | Стан: {'✅' if act else '❌'}\n"
 
     txt += (
         "\n**Команди управління:**\n"
-        "• `/give ID ДНІ` — дати/продовжити доступ (наприклад: `/give 5482150373 30`)\n"
-        "• `/ban ID` — миттєво заблокувати юзера"
+        "• `/give ID ДНІ` — надати або продовжити доступ користувачу\n"
+        "• `/ban ID` — заблокувати доступ користувачу"
     )
     await message.answer(txt, parse_mode="Markdown")
 
@@ -331,16 +392,16 @@ async def give_access_cmd(message: types.Message):
         return
     args = message.text.split()
     if len(args) < 3:
-        await message.answer("⚠️ Пиши так: `/give USER_ID ДНІ`", parse_mode="Markdown")
+        await message.answer("⚠️ Формат команди: `/give USER_ID ДНІ`", parse_mode="Markdown")
         return
     
     uid = int(args[1])
     days = int(args[2])
     new_exp = add_or_update_user(uid, "user", days=days)
     
-    await message.answer(f"✅ Користувачу `{uid}` додано {days} днів! Підписка до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`", parse_mode="Markdown")
+    await message.answer(f"✅ Користувачу `{uid}` надано доступ на {days} днів (до `{new_exp.strftime('%d.%m.%Y %H:%M')}`).", parse_mode="Markdown")
     try:
-        await bot.send_message(chat_id=uid, text=f"🎉 **Твою підписку продовжено на {days} днів!**\nДіє до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`", parse_mode="Markdown")
+        await bot.send_message(chat_id=uid, text=f"🎉 **Вашу підписку продовжено на {days} днів.**\nТермін дії до: `{new_exp.strftime('%d.%m.%Y %H:%M')}`", parse_mode="Markdown")
     except:
         pass
 
@@ -350,14 +411,14 @@ async def ban_user_cmd(message: types.Message):
         return
     args = message.text.split()
     if len(args) < 2:
-        await message.answer("⚠️ Пиши так: `/ban USER_ID`", parse_mode="Markdown")
+        await message.answer("⚠️ Формат команди: `/ban USER_ID`", parse_mode="Markdown")
         return
     
     uid = int(args[1])
     block_user(uid)
-    await message.answer(f"🚫 Користувача `{uid}` заблоковано!", parse_mode="Markdown")
+    await message.answer(f"🚫 Користувача `{uid}` заблоковано.", parse_mode="Markdown")
     try:
-        await bot.send_message(chat_id=uid, text="❌ **Твій доступ до бота було скасовано адміном.**", parse_mode="Markdown")
+        await bot.send_message(chat_id=uid, text="❌ **Ваш доступ до бота було скасовано адміністратором.**", parse_mode="Markdown")
     except:
         pass
 
@@ -365,8 +426,8 @@ async def ban_user_cmd(message: types.Message):
 async def auto_scanner():
     print("🚀 Авто-сканер активних підписок запущено!")
     while True:
-        subscribers = get_active_subscribers()
-        for user_id, search_url in subscribers:
+        subscribers_filters = get_all_active_filters()
+        for user_id, search_url in subscribers_filters:
             cars = fetch_cars_from_url(search_url)
             for title, price, location, link in reversed(cars):
                 if not is_car_sent(user_id, link):
@@ -374,11 +435,10 @@ async def auto_scanner():
                         inline_keyboard=[[InlineKeyboardButton(text="🔥 Відкрити на Auto.ria", url=link)]]
                     )
                     text = (
-                        f"🏎 **ЗНАЙДЕНО НОВИЙ ВАРІАНТ!**\n\n"
+                        f"🏎 **ЗНАЙДЕНО НОВЕ ОГОЛОШЕННЯ!**\n\n"
                         f"📌 **{title}**\n"
                         f"💵 **Ціна:** {price}\n"
-                        f"📍 **Локація:** {location}\n\n"
-                        f"⚡️ *Купуй першим, поки не перехопили!*"
+                        f"📍 **Локація:** {location}"
                     )
                     try:
                         await bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=inline_kb)
