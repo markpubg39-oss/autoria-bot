@@ -35,8 +35,20 @@ CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Повні реалістичні заголовки для обходу блокувань Auto.ria
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
 }
 
 db_pool: Optional[asyncpg.Pool] = None
@@ -53,7 +65,7 @@ def normalize_autoria_url(raw_url: str) -> str:
         parsed = urlparse(raw_url)
         params = parse_qs(parsed.query)
 
-        # order=7 — підтверджене сортування за датою додавання
+        # order=7 — сортування за датою додавання
         params["order"] = ["7"]
 
         if "page" in params:
@@ -487,7 +499,7 @@ async def main():
     )
     await init_db()
     monitoring_task = asyncio.create_task(check_updates_loop())
-    print("🤖 Бот готовий до роботи (Order=7 Normalized)!")
+    print("🤖 Бот готовий до роботи (Order=7 + Full Headers)!")
 
     try:
         await dp.start_polling(bot)
