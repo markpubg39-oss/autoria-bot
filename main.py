@@ -4,6 +4,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
 import asyncpg
@@ -40,6 +41,36 @@ HEADERS = {
 
 db_pool: Optional[asyncpg.Pool] = None
 PARALLEL_SCRAPE_LIMITER = asyncio.Semaphore(5)
+
+
+# === АВТОМАТИЧНА НОРМАЛІЗАЦІЯ ПОСИЛАННЯ (СОРТУВАННЯ ЗА ДАТОЮ) ===
+def normalize_autoria_url(raw_url: str) -> str:
+    """
+    Примусово встановлює сортування за датою подачі (order=7)
+    та скидає пагінацію на першу сторінку (page=0).
+    """
+    try:
+        parsed = urlparse(raw_url)
+        params = parse_qs(parsed.query)
+
+        # order=7 — підтверджене сортування за датою додавання
+        params["order"] = ["7"]
+
+        if "page" in params:
+            params["page"] = ["0"]
+
+        new_query = urlencode(params, doseq=True)
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
+    except Exception as e:
+        logging.error(f"Помилка нормалізації URL {raw_url}: {e}")
+        return raw_url
 
 
 # === РОБОТА З БАЗОЮ ДАНИХ (ASYNC) ===
@@ -97,7 +128,6 @@ async def get_all_users():
 
 
 async def add_filter(user_id: int, url: str) -> bool:
-    """Повертає True, якщо фільтр справді додано, False — якщо такий вже існував."""
     async with db_pool.acquire() as conn:
         result = await conn.execute("""
             INSERT INTO user_filters (user_id, url, created_at)
@@ -194,32 +224,11 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
         page_html = await fetch_html(session, url)
         if page_html is None:
             return []
-        # BeautifulSoup-парсинг — синхронний і потенційно повільний,
-        # тому виконуємо його в окремому потоці, щоб не тримати event loop.
         return await asyncio.to_thread(parse_html, page_html)
 
 
 # === НАДІЙНА ВІДПРАВКА ПОВІДОМЛЕНЬ ===
 async def safe_send_message(user_id: int, text: str, parse_mode: Optional[str] = "HTML", retries: int = 3) -> Optional[bool]:
-    """
-    Відправляє повідомлення з урахуванням Telegram flood control.
-    При TelegramRetryAfter чекає стільки, скільки просить Telegram, і пробує ще раз.
-
-    parse_mode за замовчуванням "HTML" — підходить для повідомлень, які формує
-    сам бот (заздалегідь відомий, контрольований формат з екранованими вставками).
-    Для ДОВІЛЬНОГО тексту від людини (наприклад, /broadcast) передавай
-    parse_mode=None: інакше один випадковий символ "<" чи "&" у тексті адміна
-    зверне в TelegramBadRequest і провалить розсилку ОДНАКОВО для всіх
-    користувачів одразу, а сам адмін побачить лише суху цифру "не доставлено",
-    без жодного натяку на причину.
-
-    Повертає:
-      True  — повідомлення успішно доставлено;
-      False — ПОСТІЙНА відмова (юзер заблокував бота / битий запит) —
-              повторювати сенсу немає, авто можна позначати відправленим;
-      None  — ТИМЧАСОВА помилка (мережа, невідомий збій Telegram) —
-              авто НЕ позначаємо відправленим, спробуємо ще раз наступного циклу.
-    """
     for attempt in range(retries):
         try:
             await bot.send_message(user_id, text, parse_mode=parse_mode)
@@ -228,15 +237,12 @@ async def safe_send_message(user_id: int, text: str, parse_mode: Optional[str] =
             logging.warning(f"Flood control: чекаю {e.retry_after}с перед повтором для {user_id}")
             await asyncio.sleep(e.retry_after)
         except TelegramForbiddenError:
-            # Користувач заблокував бота — повторювати немає сенсу.
             logging.info(f"Користувач {user_id} заблокував бота, пропускаю")
             return False
         except TelegramBadRequest as e:
-            # Битий запит (наприклад, невалідний HTML) не полагодиться повтором.
             logging.error(f"Некоректне повідомлення для {user_id}: {e}")
             return False
         except Exception as e:
-            # Мережевий/невідомий збій — може бути тимчасовим.
             logging.error(f"Тимчасова помилка відправки користувачу {user_id}: {e}")
             return None
     return None
@@ -256,7 +262,7 @@ async def cmd_start(message: types.Message):
         "1️⃣ Зайдіть на сайт <b>Auto.ria</b>.\n"
         "2️⃣ Вкажіть потрібні параметри (марку, ціну, рік тощо).\n"
         "3️⃣ <b>Обов'язково натисніть кнопку «Пошук»</b>, щоб сформувати список авто.\n"
-        "4️⃣ <b>НЕ заходьте в окремі оголошення!</b> Скопіюйте посилання прямо з адресної стрічки браузера зі сторінки зі списком результатів.\n"
+        "4️⃣ Скопіюйте посилання прямо з адресної стрічки браузера зі сторінки зі списком результатів.\n"
         "5️⃣ Натисніть кнопку <b>«➕ Додати посилання»</b> та надішліть його сюди.\n\n"
         "Оберіть потрібну дію в меню нижче:"
     )
@@ -302,10 +308,9 @@ async def add_filter_prompt(message: types.Message):
         "1️⃣ Зайдіть на сайт або в додаток <b>Auto.ria</b>.\n"
         "2️⃣ Виберіть усі потрібні параметри авто (марку, модель, рік, ціну, регіон).\n"
         "3️⃣ <b>Обов'язково натисніть кнопку «Пошук»</b>, щоб перед вами відкрився список знайдених машин.\n"
-        "4️⃣ <b>УВАГА: НЕ переходьте на сторінку конкретного оголошення!</b> Нам потрібне посилання саме на загальний результат пошуку.\n"
-        "5️⃣ Скопіюйте посилання з адресного рядка зверху.\n"
-        "6️⃣ <b>Надішліть скопійоване посилання сюди у відповідь на це повідомлення.</b>\n\n"
-        "💡 <i>Приклад правильного посилання:</i>\n<code>https://auto.ria.com/uk/search/?indexName=auto,s_app,g_app&categories.main.id=1&price.USD.lte=7000</code>"
+        "4️⃣ Скопіюйте посилання з адресного рядка зверху.\n"
+        "5️⃣ <b>Надішліть скопійоване посилання сюди у відповідь на це повідомлення.</b>\n\n"
+        "💡 <i>Приклад правильного посилання:</i>\n<code>https://auto.ria.com/uk/search/?categories.main.id=1&price.USD.lte=7000</code>"
     )
     await message.answer(prompt_text, parse_mode="HTML")
 
@@ -324,15 +329,18 @@ async def settings_cmd(message: types.Message):
 
 @dp.message(F.text.startswith("http://") | F.text.startswith("https://"))
 async def save_user_url(message: types.Message):
-    url = message.text.strip()
+    raw_url = message.text.strip()
 
-    if len(url) > 2000:
+    if len(raw_url) > 2000:
         await message.answer("❌ <b>Помилка!</b> Посилання занадто довге.", parse_mode="HTML")
         return
 
-    if "auto.ria.com" not in url:
+    if "auto.ria.com" not in raw_url:
         await message.answer("❌ <b>Помилка!</b> Посилання має бути саме з сайту <code>auto.ria.com</code>.\nСпробуйте ще раз.", parse_mode="HTML")
         return
+
+    # Автоматично оптимізуємо посилання під моніторинг по даті!
+    url = normalize_autoria_url(raw_url)
 
     user_id = message.from_user.id
     was_added = await add_filter(user_id, url)
@@ -343,9 +351,6 @@ async def save_user_url(message: types.Message):
 
     status_msg = await message.answer("⏳ Додаю фільтр і перевіряю поточні оголошення...")
 
-    # "Прогріваємо" фільтр: усі авто, які вже є на сторінці ЗАРАЗ, вважаємо
-    # побаченими і НЕ надсилаємо — інакше перше ж додавання виллється
-    # у шквал повідомлень і ризикує вперлося у flood control.
     try:
         async with aiohttp.ClientSession() as session:
             cars = await parse_autoria(session, url)
@@ -386,8 +391,6 @@ async def admin_panel(message: types.Message):
         return
 
     users = await get_all_users()
-    # username/full_name — довільний текст від Telegram-профілю, може
-    # містити символи, що ламають HTML, тому екрануємо.
     text = f"👑 <b>Панель адміністратора</b>\n\nВсього користувачів у базі: {len(users)}\n\n"
     for row in users[:20]:
         uname = html.escape(row["username"] or "")
@@ -397,7 +400,6 @@ async def admin_panel(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 
-# Команда розсилки всім користувачам: /broadcast Ваш текст
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID:
@@ -416,12 +418,6 @@ async def cmd_broadcast(message: types.Message, command: CommandObject):
 
     for row in users:
         u_id = row["user_id"]
-        # parse_mode=None навмисно: текст розсилки — довільний ввід адміна,
-        # а не контрольований формат бота. Якщо форсувати HTML і в тексті
-        # трапиться "<" чи "&", TelegramBadRequest провалить розсилку
-        # ОДНАКОВО для всіх користувачів одразу, а адмін побачить лише
-        # суху цифру "не доставлено" без пояснення причини. Звичайний
-        # текст цю категорію збоїв повністю прибирає.
         res = await safe_send_message(u_id, text_to_send, parse_mode=None)
         if res is True:
             success += 1
@@ -442,14 +438,9 @@ async def process_single_filter(session: aiohttp.ClientSession, user_id: int, ur
         sent_ids = await get_sent_car_ids_set(user_id)
         new_cars_to_send = [c for c in cars if c["car_id"] not in sent_ids]
 
-        # У БД позначаємо тільки те, що дійсно "закрито" — або успішно
-        # надіслано, або постійно недоставлюване (юзер заблокував бота).
-        # Тимчасові збої (None) НЕ позначаємо, щоб спробувати ще раз наступного циклу.
         confirmed_ids = []
 
         for car in new_cars_to_send:
-            # HTML тут навмисно лишається: це контрольований формат, який
-            # формує сам бот, а не довільний ввід людини (як у /broadcast).
             safe_title = html.escape(car["title"])
             safe_price = html.escape(car["price"])
             safe_link = html.escape(car["link"], quote=True)
@@ -461,8 +452,6 @@ async def process_single_filter(session: aiohttp.ClientSession, user_id: int, ur
             )
             delivered = await safe_send_message(user_id, msg)
             if delivered is not None:
-                # True (доставлено) або False (постійна відмова) — обидва
-                # варіанти більше не повторюємо.
                 confirmed_ids.append(car["car_id"])
             await asyncio.sleep(SEND_DELAY_SECONDS)
 
@@ -473,7 +462,7 @@ async def process_single_filter(session: aiohttp.ClientSession, user_id: int, ur
         logging.error(f"Помилка обробки фільтра user_id={user_id}, url={url}: {e}")
 
 
-# === ТАСК МОНІТОРИНГУ (ПАРАЛЕЛЬНИЙ СКАН) ===
+# === ТАСК МОНІТОРИНГУ ===
 async def check_updates_loop():
     async with aiohttp.ClientSession() as session:
         while True:
@@ -498,13 +487,11 @@ async def main():
     )
     await init_db()
     monitoring_task = asyncio.create_task(check_updates_loop())
-    print("🤖 Бот готовий до роботи!")
+    print("🤖 Бот готовий до роботи (Order=7 Normalized)!")
 
     try:
         await dp.start_polling(bot)
     finally:
-        # Коректне завершення: скасовуємо фоновий таск і закриваємо
-        # пул з'єднань з БД та HTTP-сесію бота, щоб не лишати "висячі" з'єднання.
         monitoring_task.cancel()
         try:
             await monitoring_task
