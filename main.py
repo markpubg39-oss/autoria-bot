@@ -1,11 +1,10 @@
 import asyncio
 import logging
-import sqlite3
 import os
 from datetime import datetime
 
 import aiohttp
-import psycopg2
+import asyncpg
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -20,6 +19,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "5482150373"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Primeza777")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    raise ValueError("Змінна DATABASE_URL обов'язкова для використання asyncpg!")
+
+# Форматуємо URL під вимоги asyncpg
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -27,125 +33,79 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# === РОБОТА З БАЗОЮ ДАНИХ ===
-def get_db_connection():
-    if DATABASE_URL:
-        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(url)
-    else:
-        return sqlite3.connect("bot_users.db")
+# Пул з'єднань з базою даних
+db_pool: asyncpg.Pool = None
 
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+# === РОБОТА З БАЗОЮ ДАНИХ (ASYNC) ===
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                join_date TEXT
+            );
+            
+            CREATE TABLE IF NOT EXISTS user_filters (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                url TEXT,
+                created_at TEXT
+            );
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            join_date TEXT
-        )
-    """)
+            CREATE TABLE IF NOT EXISTS sent_cars (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                car_id TEXT,
+                UNIQUE(user_id, car_id)
+            );
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_filters (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            url TEXT,
-            created_at TEXT
-        )
-    """)
+            CREATE INDEX IF NOT EXISTS idx_filters_user ON user_filters(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sent_user_car ON sent_cars(user_id, car_id);
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sent_cars (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            car_id TEXT,
-            UNIQUE(user_id, car_id)
-        )
-    """)
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_filters_user ON user_filters(user_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_user_car ON sent_cars(user_id, car_id)")
-
-    conn.commit()
-    conn.close()
-
-def add_user(user_id, username, full_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    if DATABASE_URL:
-        cursor.execute("""
+async def add_user(user_id: int, username: str, full_name: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
             INSERT INTO users (user_id, username, full_name, join_date)
-            VALUES (%s, %s, %s, %s)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (user_id) DO NOTHING
-        """, (user_id, username, full_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    else:
-        cursor.execute("""
-            INSERT OR IGNORE INTO users (user_id, username, full_name, join_date)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, username, full_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+        """, user_id, username, full_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-def get_all_users():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, full_name, join_date FROM users")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+async def get_all_users():
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, username, full_name, join_date FROM users")
 
-def add_filter(user_id, url):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    param = "%s" if DATABASE_URL else "?"
-    cursor.execute(f"""
-        INSERT INTO user_filters (user_id, url, created_at)
-        VALUES ({param}, {param}, {param})
-    """, (user_id, url, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+async def add_filter(user_id: int, url: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_filters (user_id, url, created_at)
+            VALUES ($1, $2, $3)
+        """, user_id, url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-def get_user_filters(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    param = "%s" if DATABASE_URL else "?"
-    cursor.execute(f"SELECT id, url FROM user_filters WHERE user_id = {param}", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+async def get_user_filters(user_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("SELECT id, url FROM user_filters WHERE user_id = $1", user_id)
 
-def delete_filter_by_id(filter_id, user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    param = "%s" if DATABASE_URL else "?"
-    cursor.execute(f"DELETE FROM user_filters WHERE id = {param} AND user_id = {param}", (filter_id, user_id))
-    conn.commit()
-    conn.close()
+async def delete_filter_by_id(filter_id: int, user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM user_filters WHERE id = $1 AND user_id = $2", filter_id, user_id)
 
-def is_car_sent(user_id, car_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    param = "%s" if DATABASE_URL else "?"
-    cursor.execute(f"SELECT 1 FROM sent_cars WHERE user_id = {param} AND car_id = {param}", (user_id, str(car_id)))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
+async def is_car_sent(user_id: int, car_id: str) -> bool:
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval("SELECT 1 FROM sent_cars WHERE user_id = $1 AND car_id = $2", user_id, str(car_id))
+        return val is not None
 
-def mark_car_sent(user_id, car_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    if DATABASE_URL:
-        cursor.execute("""
-            INSERT INTO sent_cars (user_id, car_id) VALUES (%s, %s)
+async def mark_car_sent(user_id: int, car_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2)
             ON CONFLICT (user_id, car_id) DO NOTHING
-        """, (user_id, str(car_id)))
-    else:
-        cursor.execute("INSERT OR IGNORE INTO sent_cars (user_id, car_id) VALUES (?, ?)", (user_id, str(car_id)))
-    conn.commit()
-    conn.close()
+        """, user_id, str(car_id))
 
 # === КЛАВІАТУРИ ===
 def get_main_keyboard():
@@ -206,7 +166,7 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list[dict]:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user = message.from_user
-    add_user(user.id, user.username, user.full_name)
+    await add_user(user.id, user.username or "", user.full_name or "")
 
     welcome_text = (
         f"Вітаю, {user.first_name}! 👋\n\n"
@@ -224,13 +184,15 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "📁 Мої фільтри")
 async def show_filters(message: types.Message):
-    filters = get_user_filters(message.from_user.id)
+    filters = await get_user_filters(message.from_user.id)
     if not filters:
         await message.answer("У вас поки немає збережених фільтрів.\n\nНатисніть кнопку «➕ Додати посилання», щоб відстежувати нові оголошення.")
         return
 
     await message.answer("📋 **Ваші активні відстеження:**")
-    for f_id, url in filters:
+    for row in filters:
+        f_id = row["id"]
+        url = row["url"]
         inline_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Видалити фільтр", callback_data=f"del_{f_id}")]
@@ -246,7 +208,7 @@ async def process_delete_filter(callback: types.CallbackQuery):
         await callback.answer("Не вдалося розпізнати фільтр.", show_alert=True)
         return
 
-    delete_filter_by_id(filter_id, callback.from_user.id)
+    await delete_filter_by_id(filter_id, callback.from_user.id)
     await callback.answer("Фільтр успішно видалено!", show_alert=True)
     await callback.message.delete()
 
@@ -282,7 +244,7 @@ async def save_user_url(message: types.Message):
         await message.answer("❌ **Помилка!** Посилання має бути саме з сайту `auto.ria.com`.\nСпробуйте ще раз.", parse_mode="Markdown")
         return
 
-    add_filter(message.from_user.id, url)
+    await add_filter(message.from_user.id, url)
     await message.answer("✅ **Посилання успішно додано!**\n\nТепер бот перевірятиме появу нових авто за цим фільтром щохвилини й миттєво надсилатиме їх сюди.", reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 @dp.message(F.text == "ℹ️ Інформація")
@@ -304,10 +266,10 @@ async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    users = get_all_users()
+    users = await get_all_users()
     text = f"👑 **Панель адміністратора**\n\nВсього користувачів у базі: {len(users)}\n\n"
-    for u_id, uname, fname, jdate in users[:20]:
-        text += f"• ID: `{u_id}` | @{uname} | {fname} ({jdate})\n"
+    for row in users[:20]:
+        text += f"• ID: `{row['user_id']}` | @{row['username']} | {row['full_name']} ({row['join_date']})\n"
 
     await message.answer(text, parse_mode="Markdown")
 
@@ -316,16 +278,16 @@ async def check_updates_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("SELECT DISTINCT user_id, url FROM user_filters")
-                filters = cursor.fetchall()
-                conn.close()
+                async with db_pool.acquire() as conn:
+                    filters = await conn.fetch("SELECT DISTINCT user_id, url FROM user_filters")
 
-                for user_id, url in filters:
+                for row in filters:
+                    user_id = row["user_id"]
+                    url = row["url"]
                     cars = await parse_autoria(session, url)
+                    
                     for car in cars:
-                        if not is_car_sent(user_id, car["car_id"]):
+                        if not await is_car_sent(user_id, car["car_id"]):
                             msg = (
                                 f"🚗 **Нове оголошення!**\n\n"
                                 f"📌 **{car['title']}**\n"
@@ -334,7 +296,7 @@ async def check_updates_loop():
                             )
                             try:
                                 await bot.send_message(user_id, msg, parse_mode="Markdown")
-                                mark_car_sent(user_id, car["car_id"])
+                                await mark_car_sent(user_id, car["car_id"])
                             except Exception as e:
                                 logging.error(f"Не вдалося відправити повідомлення користувачу {user_id}: {e}")
                     await asyncio.sleep(2)
@@ -345,10 +307,11 @@ async def check_updates_loop():
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    init_db()
+    await init_db()
     asyncio.create_task(check_updates_loop())
-    print("🤖 Бот готовий до роботи!")
+    print("🤖 Бот готовий до роботи (AsyncPG Pool Active)!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
