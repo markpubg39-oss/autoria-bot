@@ -1,18 +1,22 @@
 import asyncio
 import logging
 import sqlite3
-import requests
 import os
 from datetime import datetime
+
+import aiohttp
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # === ОСНОВНІ НАЛАШТУВАННЯ ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8929265743:AAHzDsN83KBVUg1FfPFZvfQyasTvLkWK9bk")
-ADMIN_ID = 5482150373  # Твій Telegram ID
-ADMIN_USERNAME = "Primeza777"  # Твій юзернейм в TG
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("Змінна середовища BOT_TOKEN не встановлена!")
+
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5482150373"))  # Твій Telegram ID
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Primeza777")  # Твій юзернейм в TG
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -21,12 +25,14 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
+DB_PATH = "bot_users.db"
+
+
 # === РОБОТА З БАЗОЮ ДАНИХ ===
 def init_db():
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Таблиця користувачів
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -35,8 +41,7 @@ def init_db():
             join_date TEXT
         )
     """)
-    
-    # Таблиця фільтрів/посилань
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,8 +50,7 @@ def init_db():
             created_at TEXT
         )
     """)
-    
-    # Таблиця вже відправлених оголошень
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sent_cars (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,12 +59,16 @@ def init_db():
             UNIQUE(user_id, car_id)
         )
     """)
-    
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_filters_user ON user_filters(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sent_user_car ON sent_cars(user_id, car_id)")
+
     conn.commit()
     conn.close()
 
+
 def add_user(user_id, username, full_name):
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT OR IGNORE INTO users (user_id, username, full_name, join_date)
@@ -69,16 +77,18 @@ def add_user(user_id, username, full_name):
     conn.commit()
     conn.close()
 
+
 def get_all_users():
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, username, full_name, join_date FROM users")
     rows = cursor.fetchall()
     conn.close()
     return rows
 
+
 def add_filter(user_id, url):
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO user_filters (user_id, url, created_at)
@@ -87,35 +97,40 @@ def add_filter(user_id, url):
     conn.commit()
     conn.close()
 
+
 def get_user_filters(user_id):
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT id, url FROM user_filters WHERE user_id = ?", (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
+
 def delete_filter_by_id(filter_id, user_id):
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM user_filters WHERE id = ? AND user_id = ?", (filter_id, user_id))
     conn.commit()
     conn.close()
 
+
 def is_car_sent(user_id, car_id):
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM sent_cars WHERE user_id = ? AND car_id = ?", (user_id, car_id))
     result = cursor.fetchone()
     conn.close()
     return result is not None
 
+
 def mark_car_sent(user_id, car_id):
-    conn = sqlite3.connect("bot_users.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO sent_cars (user_id, car_id) VALUES (?, ?)", (user_id, car_id))
     conn.commit()
     conn.close()
+
 
 # === КЛАВІАТУРИ ===
 def get_main_keyboard():
@@ -129,47 +144,63 @@ def get_main_keyboard():
     )
     return keyboard
 
+
 # === ПАРСИНГ AUTO.RIA ===
-def parse_autoria(url):
+async def fetch_html(session: aiohttp.ClientSession, url: str) -> str | None:
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code != 200:
-            return []
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        cars = []
-        
-        sections = soup.find_all("section", class_="ticket-item")
-        for section in sections:
-            car_id = section.get("data-id") or section.get("data-good-id")
-            if not car_id:
-                continue
-            
-            title_elem = section.find("a", class_="address")
-            title = title_elem.text.strip() if title_elem else "Автомобіль"
-            link = title_elem.get("href") if title_elem else ""
-            
-            price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket")
-            price = price_elem.text.strip() if price_elem else "Ціну не вказано"
-            
-            cars.append({
-                "car_id": str(car_id),
-                "title": title,
-                "price": price,
-                "link": link
-            })
-            
-        return cars
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            if response.status != 200:
+                logging.warning(f"auto.ria повернув статус {response.status} для {url}")
+                return None
+            return await response.text()
     except Exception as e:
-        logging.error(f"Помилка парсингу {url}: {e}")
+        logging.error(f"Помилка запиту до {url}: {e}")
+        return None
+
+
+def parse_html(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    cars = []
+
+    sections = soup.find_all("section", class_="ticket-item")
+    if not sections:
+        logging.info("Парсер не знайшов жодного 'ticket-item' — перевір, чи не змінилась верстка сайту")
+
+    for section in sections:
+        car_id = section.get("data-id") or section.get("data-good-id")
+        if not car_id:
+            continue
+
+        title_elem = section.find("a", class_="address")
+        title = title_elem.text.strip() if title_elem else "Автомобіль"
+        link = title_elem.get("href") if title_elem else ""
+
+        price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket")
+        price = price_elem.text.strip() if price_elem else "Ціну не вказано"
+
+        cars.append({
+            "car_id": str(car_id),
+            "title": title,
+            "price": price,
+            "link": link
+        })
+
+    return cars
+
+
+async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list[dict]:
+    html = await fetch_html(session, url)
+    if html is None:
         return []
+    return await asyncio.to_thread(parse_html, html)
+
 
 # === ОБРОБНИКИ КОМАНД ТА ПОВІДОМЛЕНЬ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user = message.from_user
     add_user(user.id, user.username, user.full_name)
-    
+
     welcome_text = (
         f"Вітаю, {user.first_name}! 👋\n\n"
         "⚡ **Бот для автоматичного моніторингу оголошень Auto.ria**\n\n"
@@ -184,13 +215,14 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
+
 @dp.message(F.text == "📁 Мої фільтри")
 async def show_filters(message: types.Message):
     filters = get_user_filters(message.from_user.id)
     if not filters:
         await message.answer("У вас поки немає збережених фільтрів.\n\nНатисніть кнопку «➕ Додати посилання», щоб відстежувати нові оголошення.")
         return
-    
+
     await message.answer("📋 **Ваші активні відстеження:**")
     for f_id, url in filters:
         inline_kb = InlineKeyboardMarkup(
@@ -200,12 +232,19 @@ async def show_filters(message: types.Message):
         )
         await message.answer(f"🔗 `{url}`", reply_markup=inline_kb, parse_mode="Markdown")
 
+
 @dp.callback_query(F.data.startswith("del_"))
 async def process_delete_filter(callback: types.CallbackQuery):
-    filter_id = int(callback.data.split("_")[1])
+    try:
+        filter_id = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Не вдалося розпізнати фільтр.", show_alert=True)
+        return
+
     delete_filter_by_id(filter_id, callback.from_user.id)
     await callback.answer("Фільтр успішно видалено!", show_alert=True)
     await callback.message.delete()
+
 
 @dp.message(F.text == "➕ Додати посилання")
 async def add_filter_prompt(message: types.Message):
@@ -221,6 +260,7 @@ async def add_filter_prompt(message: types.Message):
     )
     await message.answer(prompt_text, parse_mode="Markdown")
 
+
 @dp.message(F.text == "⚙️ Налаштування")
 async def settings_cmd(message: types.Message):
     settings_text = (
@@ -232,15 +272,17 @@ async def settings_cmd(message: types.Message):
     )
     await message.answer(settings_text, parse_mode="Markdown")
 
+
 @dp.message(F.text.startswith("http://") | F.text.startswith("https://"))
 async def save_user_url(message: types.Message):
     url = message.text.strip()
     if "auto.ria.com" not in url:
         await message.answer("❌ **Помилка!** Посилання має бути саме з сайту `auto.ria.com`.\nСпробуйте ще раз.", parse_mode="Markdown")
         return
-    
+
     add_filter(message.from_user.id, url)
     await message.answer("✅ **Посилання успішно додано!**\n\nТепер бот перевірятиме появу нових авто за цим фільтром щохвилини й миттєво надсилатиме їх сюди.", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+
 
 @dp.message(F.text == "ℹ️ Інформація")
 async def info_cmd(message: types.Message):
@@ -251,53 +293,58 @@ async def info_cmd(message: types.Message):
     )
     await message.answer(info_text, parse_mode="Markdown")
 
+
 @dp.message(F.text == "📞 Підтримка")
 async def support_cmd(message: types.Message):
     await message.answer(f"З усіх питань, пропозицій чи багів звертайтеся до адміністратора: @{ADMIN_USERNAME}")
+
 
 # === АДМІН-КОМАНДИ ===
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    
+
     users = get_all_users()
     text = f"👑 **Панель адміністратора**\n\nВсього користувачів у базі: {len(users)}\n\n"
     for u_id, uname, fname, jdate in users[:20]:
         text += f"• ID: `{u_id}` | @{uname} | {fname} ({jdate})\n"
-    
+
     await message.answer(text, parse_mode="Markdown")
+
 
 # === ТАСК МОНІТОРИНГУ ===
 async def check_updates_loop():
-    while True:
-        try:
-            conn = sqlite3.connect("bot_users.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT user_id, url FROM user_filters")
-            filters = cursor.fetchall()
-            conn.close()
-            
-            for user_id, url in filters:
-                cars = parse_autoria(url)
-                for car in cars:
-                    if not is_car_sent(user_id, car["car_id"]):
-                        msg = (
-                            f"🚗 **Нове оголошення!**\n\n"
-                            f"📌 **{car['title']}**\n"
-                            f"💰 **Ціна:** {car['price']}\n\n"
-                            f"🔗 [Переглянути оголошення]({car['link']})"
-                        )
-                        try:
-                            await bot.send_message(user_id, msg, parse_mode="Markdown")
-                            mark_car_sent(user_id, car["car_id"])
-                        except Exception as e:
-                            logging.error(f"Не вдалося відправити повідомлення користувачу {user_id}: {e}")
-                await asyncio.sleep(2)
-        except Exception as e:
-            logging.error(f"Помилка у циклі перевірки: {e}")
-        
-        await asyncio.sleep(60)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("SELECT DISTINCT user_id, url FROM user_filters")
+                filters = cursor.fetchall()
+                conn.close()
+
+                for user_id, url in filters:
+                    cars = await parse_autoria(session, url)
+                    for car in cars:
+                        if not is_car_sent(user_id, car["car_id"]):
+                            msg = (
+                                f"🚗 **Нове оголошення!**\n\n"
+                                f"📌 **{car['title']}**\n"
+                                f"💰 **Ціна:** {car['price']}\n\n"
+                                f"🔗 [Переглянути оголошення]({car['link']})"
+                            )
+                            try:
+                                await bot.send_message(user_id, msg, parse_mode="Markdown")
+                                mark_car_sent(user_id, car["car_id"])
+                            except Exception as e:
+                                logging.error(f"Не вдалося відправити повідомлення користувачу {user_id}: {e}")
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logging.error(f"Помилка у циклі перевірки: {e}")
+
+            await asyncio.sleep(60)
+
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -305,6 +352,7 @@ async def main():
     asyncio.create_task(check_updates_loop())
     print("🤖 Бот готовий до роботи!")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
