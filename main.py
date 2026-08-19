@@ -64,7 +64,7 @@ async def init_db():
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS bot_users (
                 user_id BIGINT PRIMARY KEY,
                 subscription_expires TIMESTAMP
             );
@@ -89,7 +89,7 @@ async def check_subscription(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
     async with db_pool.acquire() as conn:
-        expires = await conn.fetchval("SELECT subscription_expires FROM users WHERE user_id = $1", user_id)
+        expires = await conn.fetchval("SELECT subscription_expires FROM bot_users WHERE user_id = $1", user_id)
     if not expires:
         return False
     return expires > datetime.now()
@@ -156,8 +156,8 @@ def get_main_keyboard():
 async def start(msg: types.Message):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO users (user_id, subscription_expires) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-            msg.from_user.id, datetime.now() + timedelta(days=1)  # Тобі бонус 1 день або безкоштовний старт
+            "INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+            msg.from_user.id, datetime.now() + timedelta(days=1)
         )
     
     await msg.answer(
@@ -175,7 +175,7 @@ async def subscription_status(msg: types.Message):
         return
 
     async with db_pool.acquire() as conn:
-        expires = await conn.fetchval("SELECT subscription_expires FROM users WHERE user_id = $1", user_id)
+        expires = await conn.fetchval("SELECT subscription_expires FROM bot_users WHERE user_id = $1", user_id)
 
     if expires and expires > datetime.now():
         date_str = expires.strftime("%Y-%m-%d %H:%M")
@@ -302,7 +302,7 @@ async def grant_subscription(msg: types.Message):
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO users (user_id, subscription_expires) VALUES ($1, $2)
+            INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, $2)
             ON CONFLICT (user_id) DO UPDATE SET subscription_expires = $2
         """, target_user_id, new_expire)
 
@@ -321,7 +321,6 @@ async def monitor():
                     for f in filters:
                         user_id = f["user_id"]
                         
-                        # Перевіряємо підписку перед кожним скануванням
                         if not await check_subscription(user_id):
                             continue
 
@@ -365,7 +364,7 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     await init_db()
     asyncio.create_task(monitor())
-    logging.info("Бот повністю готовий і запущений з підписками!")
+    logging.info("Бот повністю запущений і працює!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
