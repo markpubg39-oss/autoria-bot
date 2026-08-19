@@ -32,7 +32,7 @@ if DATABASE_URL.startswith("postgres://"):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Оновлені заголовки з правильним Host та Referer для обходу захисту Auto.ria
+# Заголовки для обходу захисту Auto.ria
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -130,7 +130,6 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
             soup = BeautifulSoup(html_text, "html.parser")
             
-            # Універсальний пошук карток оголошень
             sections = soup.find_all("section", class_="ticket-item")
             if not sections:
                 sections = soup.select('div.ticket-item, div[data-ftid="item"], div.search-result-item')
@@ -448,11 +447,15 @@ async def main():
     global http_session
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     await init_db()
+    
+    # Примусово скидаємо старі вебхуки та сесії, щоб уникнути конфліктів
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     http_session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
     try:
         asyncio.create_task(monitor())
         logging.info("Бот повністю запущений і працює!")
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, handle_signals=True)
     finally:
         await http_session.close()
 
