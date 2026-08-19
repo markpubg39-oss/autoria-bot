@@ -1,12 +1,15 @@
 import asyncio
+import html
 import logging
 import os
 from datetime import datetime
+from typing import Optional
 
 import aiohttp
 import asyncpg
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
@@ -22,9 +25,15 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("Змінна DATABASE_URL обов'язкова для використання asyncpg!")
 
-# Форматуємо URL під вимоги asyncpg
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Скільки секунд чекати між надісланими повідомленнями одному користувачу
+# (Telegram дозволяє ~1 msg/sec в один чат, беремо із запасом).
+SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "0.4"))
+
+# Раз на скільки секунд запускати повний цикл перевірки фільтрів.
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -34,13 +43,17 @@ HEADERS = {
 }
 
 # Пул з'єднань з базою даних
-db_pool: asyncpg.Pool = None
+db_pool: Optional[asyncpg.Pool] = None
+
+# Семафор для обмеження кількості паралельних запитів до Auto.ria (захист від бана IP)
+PARALLEL_SCRAPE_LIMITER = asyncio.Semaphore(5)
+
 
 # === РОБОТА З БАЗОЮ ДАНИХ (ASYNC) ===
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
-    
+
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -49,24 +62,32 @@ async def init_db():
                 full_name TEXT,
                 join_date TEXT
             );
-            
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_filters (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
                 url TEXT,
-                created_at TEXT
+                created_at TEXT,
+                UNIQUE(user_id, url)
             );
-
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_cars (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
                 car_id TEXT,
                 UNIQUE(user_id, car_id)
             );
-
-            CREATE INDEX IF NOT EXISTS idx_filters_user ON user_filters(user_id);
-            CREATE INDEX IF NOT EXISTS idx_sent_user_car ON sent_cars(user_id, car_id);
         """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_filters_user ON user_filters(user_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_user_car ON sent_cars(user_id, car_id);")
+
+
+async def close_db():
+    if db_pool is not None:
+        await db_pool.close()
+
 
 async def add_user(user_id: int, username: str, full_name: str):
     async with db_pool.acquire() as conn:
@@ -76,36 +97,50 @@ async def add_user(user_id: int, username: str, full_name: str):
             ON CONFLICT (user_id) DO NOTHING
         """, user_id, username, full_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
+
 async def get_all_users():
     async with db_pool.acquire() as conn:
         return await conn.fetch("SELECT user_id, username, full_name, join_date FROM users")
 
-async def add_filter(user_id: int, url: str):
+
+async def add_filter(user_id: int, url: str) -> bool:
+    """Повертає True, якщо фільтр справді додано, False — якщо такий вже існував."""
     async with db_pool.acquire() as conn:
-        await conn.execute("""
+        result = await conn.execute("""
             INSERT INTO user_filters (user_id, url, created_at)
             VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, url) DO NOTHING
         """, user_id, url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        # asyncpg повертає рядок на кшталт "INSERT 0 1" (1 = вставлено) або "INSERT 0 0" (конфлікт)
+        return result.endswith(" 1")
+
 
 async def get_user_filters(user_id: int):
     async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT id, url FROM user_filters WHERE user_id = $1", user_id)
+        return await conn.fetch("SELECT id, url FROM user_filters WHERE user_id = $1 ORDER BY id", user_id)
+
 
 async def delete_filter_by_id(filter_id: int, user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM user_filters WHERE id = $1 AND user_id = $2", filter_id, user_id)
 
-async def is_car_sent(user_id: int, car_id: str) -> bool:
-    async with db_pool.acquire() as conn:
-        val = await conn.fetchval("SELECT 1 FROM sent_cars WHERE user_id = $1 AND car_id = $2", user_id, str(car_id))
-        return val is not None
 
-async def mark_car_sent(user_id: int, car_id: str):
+async def get_sent_car_ids_set(user_id: int) -> set:
     async with db_pool.acquire() as conn:
-        await conn.execute("""
+        rows = await conn.fetch("SELECT car_id FROM sent_cars WHERE user_id = $1", user_id)
+        return {row["car_id"] for row in rows}
+
+
+async def mark_cars_sent_batch(user_id: int, car_ids: list):
+    if not car_ids:
+        return
+    async with db_pool.acquire() as conn:
+        records = [(user_id, car_id) for car_id in car_ids]
+        await conn.executemany("""
             INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2)
             ON CONFLICT (user_id, car_id) DO NOTHING
-        """, user_id, str(car_id))
+        """, records)
+
 
 # === КЛАВІАТУРИ ===
 def get_main_keyboard():
@@ -118,8 +153,9 @@ def get_main_keyboard():
         resize_keyboard=True
     )
 
+
 # === ПАРСИНГ AUTO.RIA ===
-async def fetch_html(session: aiohttp.ClientSession, url: str) -> str | None:
+async def fetch_html(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status != 200:
@@ -130,11 +166,17 @@ async def fetch_html(session: aiohttp.ClientSession, url: str) -> str | None:
         logging.error(f"Помилка запиту до {url}: {e}")
         return None
 
-def parse_html(html: str) -> list[dict]:
+
+def parse_html(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     cars = []
 
     sections = soup.find_all("section", class_="ticket-item")
+    if not sections:
+        # Порожній результат може означати як "немає авто", так і те,
+        # що auto.ria змінили верстку — логуємо, щоб було видно проблему швидко.
+        logging.info("Парсер не знайшов жодного 'ticket-item' — перевір, чи не змінилась верстка сайту")
+
     for section in sections:
         car_id = section.get("data-id") or section.get("data-good-id")
         if not car_id:
@@ -156,11 +198,54 @@ def parse_html(html: str) -> list[dict]:
 
     return cars
 
-async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list[dict]:
-    html = await fetch_html(session, url)
-    if html is None:
-        return []
-    return await asyncio.to_thread(parse_html, html)
+
+async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
+    async with PARALLEL_SCRAPE_LIMITER:
+        html = await fetch_html(session, url)
+        if html is None:
+            return []
+        # BeautifulSoup-парсинг — синхронний і потенційно повільний,
+        # тому виконуємо його в окремому потоці, щоб не тримати event loop.
+        return await asyncio.to_thread(parse_html, html)
+
+
+# === НАДІЙНА ВІДПРАВКА ПОВІДОМЛЕНЬ ===
+async def safe_send_message(user_id: int, text: str, retries: int = 3) -> Optional[bool]:
+    """
+    Відправляє повідомлення з урахуванням Telegram flood control.
+    При TelegramRetryAfter чекає стільки, скільки просить Telegram, і пробує ще раз.
+
+    Повертає:
+      True  — повідомлення успішно доставлено;
+      False — ПОСТІЙНА відмова (юзер заблокував бота / битий запит) —
+              повторювати сенсу немає, авто можна позначати відправленим;
+      None  — ТИМЧАСОВА помилка (мережа, невідомий збій Telegram) —
+              авто НЕ позначаємо відправленим, спробуємо ще раз наступного циклу.
+    """
+    for attempt in range(retries):
+        try:
+            await bot.send_message(user_id, text, parse_mode="HTML")
+            return True
+        except TelegramRetryAfter as e:
+            logging.warning(f"Flood control: чекаю {e.retry_after}с перед повтором для {user_id}")
+            await asyncio.sleep(e.retry_after)
+        except TelegramForbiddenError:
+            # Користувач заблокував бота — повторювати немає сенсу.
+            logging.info(f"Користувач {user_id} заблокував бота, пропускаю")
+            return False
+        except TelegramBadRequest as e:
+            # Битий запит (наприклад, не той HTML) не полагодиться повтором —
+            # це постійна відмова саме для цього повідомлення.
+            logging.error(f"Некоректне повідомлення для {user_id}: {e}")
+            return False
+        except Exception as e:
+            # Мережевий/невідомий збій — може бути тимчасовим, тому не
+            # позначаємо авто відправленим і даємо шанс наступного циклу.
+            logging.error(f"Тимчасова помилка відправки користувачу {user_id}: {e}")
+            return None
+    # Вичерпали спроби через постійні flood-control затримки — теж тимчасово.
+    return None
+
 
 # === ОБРОБНИКИ КОМАНД ===
 @dp.message(Command("start"))
@@ -182,6 +267,7 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
+
 @dp.message(F.text == "📁 Мої фільтри")
 async def show_filters(message: types.Message):
     filters = await get_user_filters(message.from_user.id)
@@ -200,6 +286,7 @@ async def show_filters(message: types.Message):
         )
         await message.answer(f"🔗 `{url}`", reply_markup=inline_kb, parse_mode="Markdown")
 
+
 @dp.callback_query(F.data.startswith("del_"))
 async def process_delete_filter(callback: types.CallbackQuery):
     try:
@@ -211,6 +298,7 @@ async def process_delete_filter(callback: types.CallbackQuery):
     await delete_filter_by_id(filter_id, callback.from_user.id)
     await callback.answer("Фільтр успішно видалено!", show_alert=True)
     await callback.message.delete()
+
 
 @dp.message(F.text == "➕ Додати посилання")
 async def add_filter_prompt(message: types.Message):
@@ -226,26 +314,60 @@ async def add_filter_prompt(message: types.Message):
     )
     await message.answer(prompt_text, parse_mode="Markdown")
 
+
 @dp.message(F.text == "⚙️ Налаштування")
 async def settings_cmd(message: types.Message):
     settings_text = (
         "⚙️ **Налаштування моніторингу**\n\n"
-        "• **Частота перевірки:** Щохвилини ⏱️\n"
+        f"• **Частота перевірки:** раз на {CHECK_INTERVAL_SECONDS} сек ⏱️\n"
         "• **Сповіщення:** Миттєві 🔔\n"
         "• **Статус сканера:** Працює 24/7 ✅\n\n"
         "Щоб переглянути або видалити ваші збережені пошуки, скористайтеся кнопкою **«📁 Мої фільтри»**."
     )
     await message.answer(settings_text, parse_mode="Markdown")
 
+
 @dp.message(F.text.startswith("http://") | F.text.startswith("https://"))
 async def save_user_url(message: types.Message):
     url = message.text.strip()
+
+    if len(url) > 2000:
+        await message.answer("❌ **Помилка!** Посилання занадто довге.", parse_mode="Markdown")
+        return
+
     if "auto.ria.com" not in url:
         await message.answer("❌ **Помилка!** Посилання має бути саме з сайту `auto.ria.com`.\nСпробуйте ще раз.", parse_mode="Markdown")
         return
 
-    await add_filter(message.from_user.id, url)
-    await message.answer("✅ **Посилання успішно додано!**\n\nТепер бот перевірятиме появу нових авто за цим фільтром щохвилини й миттєво надсилатиме їх сюди.", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    user_id = message.from_user.id
+    was_added = await add_filter(user_id, url)
+
+    if not was_added:
+        await message.answer("ℹ️ Такий фільтр у вас вже є — нічого додавати не потрібно.", reply_markup=get_main_keyboard())
+        return
+
+    status_msg = await message.answer("⏳ Додаю фільтр і перевіряю поточні оголошення...")
+
+    # "Прогріваємо" фільтр: усі авто, які вже є на сторінці ЗАРАЗ, вважаємо
+    # побаченими і НЕ надсилаємо — інакше перше ж додавання виллється
+    # у шквал з 20-50 повідомлень одразу і ризикує вперлися у flood control.
+    try:
+        async with aiohttp.ClientSession() as session:
+            cars = await parse_autoria(session, url)
+        if cars:
+            await mark_cars_sent_batch(user_id, [c["car_id"] for c in cars])
+    except Exception as e:
+        logging.error(f"Не вдалося прогріти фільтр для {user_id}, url={url}: {e}")
+
+    await status_msg.delete()
+    await message.answer(
+        "✅ **Посилання успішно додано!**\n\n"
+        "Тепер бот перевірятиме появу нових авто за цим фільтром і миттєво надсилатиме їх сюди. "
+        "Оголошення, що вже є на сторінці зараз, не надсилаються — тільки нові.",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+
 
 @dp.message(F.text == "ℹ️ Інформація")
 async def info_cmd(message: types.Message):
@@ -256,9 +378,11 @@ async def info_cmd(message: types.Message):
     )
     await message.answer(info_text, parse_mode="Markdown")
 
+
 @dp.message(F.text == "📞 Підтримка")
 async def support_cmd(message: types.Message):
     await message.answer(f"З усіх питань, пропозицій чи багів звертайтеся до адміністратора: @{ADMIN_USERNAME}")
+
 
 # === АДМІН-КОМАНДИ ===
 @dp.message(Command("admin"))
@@ -267,13 +391,60 @@ async def admin_panel(message: types.Message):
         return
 
     users = await get_all_users()
-    text = f"👑 **Панель адміністратора**\n\nВсього користувачів у базі: {len(users)}\n\n"
+    # username/full_name — довільний текст від користувача Telegram, може
+    # містити символи, що ламають Markdown, тому теж екрануємо через HTML.
+    text = f"👑 <b>Панель адміністратора</b>\n\nВсього користувачів у базі: {len(users)}\n\n"
     for row in users[:20]:
-        text += f"• ID: `{row['user_id']}` | @{row['username']} | {row['full_name']} ({row['join_date']})\n"
+        uname = html.escape(row["username"] or "")
+        fname = html.escape(row["full_name"] or "")
+        text += f"• ID: <code>{row['user_id']}</code> | @{uname} | {fname} ({row['join_date']})\n"
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="HTML")
 
-# === ТАСК МОНІТОРИНГУ ===
+
+# === ІЗОЛЬОВАНА ОБРОБКА ОДНОГО ФІЛЬТРУ ===
+async def process_single_filter(session: aiohttp.ClientSession, user_id: int, url: str):
+    try:
+        cars = await parse_autoria(session, url)
+        if not cars:
+            return
+
+        sent_ids = await get_sent_car_ids_set(user_id)
+        new_cars_to_send = [c for c in cars if c["car_id"] not in sent_ids]
+
+        # У БД позначаємо тільки те, що дійсно "закрито" — або успішно
+        # надіслано, або постійно недоставлюване (юзер заблокував бота).
+        # Тимчасові збої (None) НЕ позначаємо, щоб спробувати ще раз наступного циклу.
+        confirmed_ids = []
+
+        for car in new_cars_to_send:
+            # HTML замість Markdown: заголовки з auto.ria можуть містити
+            # символи *, _, <, > (наприклад, у назвах комплектацій) —
+            # у Markdown-режимі вони ламали парсинг (TelegramBadRequest).
+            safe_title = html.escape(car["title"])
+            safe_price = html.escape(car["price"])
+            safe_link = html.escape(car["link"], quote=True)
+            msg = (
+                f"🚗 <b>Нове оголошення!</b>\n\n"
+                f"📌 <b>{safe_title}</b>\n"
+                f"💰 <b>Ціна:</b> {safe_price}\n\n"
+                f'🔗 <a href="{safe_link}">Переглянути оголошення</a>'
+            )
+            delivered = await safe_send_message(user_id, msg)
+            if delivered is not None:
+                # True (доставлено) або False (постійна відмова) — обидва
+                # варіанти більше не повторюємо.
+                confirmed_ids.append(car["car_id"])
+            await asyncio.sleep(SEND_DELAY_SECONDS)
+
+        if confirmed_ids:
+            await mark_cars_sent_batch(user_id, confirmed_ids)
+
+    except Exception as e:
+        logging.error(f"Помилка обробки фільтра user_id={user_id}, url={url}: {e}")
+
+
+# === ТАСК МОНІТОРИНГУ (ПАРАЛЕЛЬНИЙ СКАН) ===
 async def check_updates_loop():
     async with aiohttp.ClientSession() as session:
         while True:
@@ -281,37 +452,38 @@ async def check_updates_loop():
                 async with db_pool.acquire() as conn:
                     filters = await conn.fetch("SELECT DISTINCT user_id, url FROM user_filters")
 
-                for row in filters:
-                    user_id = row["user_id"]
-                    url = row["url"]
-                    cars = await parse_autoria(session, url)
-                    
-                    for car in cars:
-                        if not await is_car_sent(user_id, car["car_id"]):
-                            msg = (
-                                f"🚗 **Нове оголошення!**\n\n"
-                                f"📌 **{car['title']}**\n"
-                                f"💰 **Ціна:** {car['price']}\n\n"
-                                f"🔗 [Переглянути оголошення]({car['link']})"
-                            )
-                            try:
-                                await bot.send_message(user_id, msg, parse_mode="Markdown")
-                                await mark_car_sent(user_id, car["car_id"])
-                            except Exception as e:
-                                logging.error(f"Не вдалося відправити повідомлення користувачу {user_id}: {e}")
-                    await asyncio.sleep(2)
-            except Exception as e:
-                logging.error(f"Помилка у циклі перевірки: {e}")
+                if filters:
+                    tasks = [process_single_filter(session, row["user_id"], row["url"]) for row in filters]
+                    await asyncio.gather(*tasks)
 
-            await asyncio.sleep(60)
+            except Exception as e:
+                logging.error(f"Помилка у глобальному циклі перевірки: {e}")
+
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
     await init_db()
-    asyncio.create_task(check_updates_loop())
-    print("🤖 Бот готовий до роботи (AsyncPG Pool Active)!")
-    await dp.start_polling(bot)
+    monitoring_task = asyncio.create_task(check_updates_loop())
+    print("🤖 Бот готовий до роботи!")
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Коректне завершення: скасовуємо фоновий таск і закриваємо
+        # пул з'єднань з БД та HTTP-сесію бота, щоб не лишати "висячі" з'єднання.
+        monitoring_task.cancel()
+        try:
+            await monitoring_task
+        except asyncio.CancelledError:
+            pass
+        await close_db()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
