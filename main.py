@@ -32,25 +32,22 @@ if DATABASE_URL.startswith("postgres://"):
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Реалістичні заголовки для обходу захисту Auto.ria
+# Оновлені заголовки під виглядом реального браузера Chrome на Windows
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Site": "cross-site",
     "Sec-Fetch-User": "?1",
-    "Connection": "keep-alive",
+    "Cache-Control": "max-age=0"
 }
 
 db_pool: Optional[asyncpg.Pool] = None
-# ОДНА спільна HTTP-сесія з cookie jar на весь час роботи бота.
-# Це важливо: постійні кукі виглядають для антибот-захисту набагато
-# "живішими", ніж свіжа сесія без жодної історії на кожен запит.
 http_session: Optional[aiohttp.ClientSession] = None
 
 
@@ -122,50 +119,49 @@ async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
 # === ПАРСИНГ AUTO.RIA ===
 async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        # Робимо запит із заголовками та збереженням кукі
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
             html_text = await resp.text()
 
             if resp.status != 200:
-                # Раніше тут просто мовчки повертався []. Тепер логуємо статус
-                # і шматок тіла відповіді — це майже завжди 403/капча/rate-limit.
-                logging.warning(
-                    f"Auto.ria повернув статус {resp.status} для {url}. "
-                    f"Перші 300 симв. відповіді: {html_text[:300]!r}"
-                )
+                logging.warning(f"Auto.ria повернув статус {resp.status} для {url}. HTML: {html_text[:200]!r}")
                 return []
 
             soup = BeautifulSoup(html_text, "html.parser")
-
+            
+            # Шукаємо оголошення за різними можливими селекторами верстки Auto.ria
             sections = soup.find_all("section", class_="ticket-item")
             if not sections:
-                # Запасний варіант, якщо auto.ria змінили верстку карток
-                sections = soup.select('section.ticket-item, div[data-marker="list-item"]')
+                sections = soup.select('div.ticket-item, div[data-ftid="item"], div.search-result-item')
 
-            logging.info(
-                f"Парсинг {url}: статус={resp.status}, довжина HTML={len(html_text)}, "
-                f"знайдено блоків={len(sections)}"
-            )
-
-            if not sections:
-                # 0 оголошень при статусі 200 і непорожньому HTML — це НЕ "нема авто",
-                # а скоріш за все зміна верстки сайту або антибот-сторінка (капча/challenge).
-                logging.warning(
-                    f"0 оголошень для {url}, хоча статус 200. Схоже на блокування/капчу "
-                    f"або зміну верстки. Сніппет: {html_text[:500]!r}"
-                )
+            logging.info(f"Парсинг {url}: статус={resp.status}, довжина HTML={len(html_text)}, знайдено карток={len(sections)}")
 
             cars = []
             for section in sections:
                 try:
+                    # Витягуємо ID оголошення
                     car_id = section.get("data-id") or section.get("data-good-id")
                     if not car_id:
+                        # Шукаємо всередині блоку, якщо атрибут на самому тезі відсутній
+                        link_elem = section.find("a", class_="address") or section.find("a", href=True)
+                        if link_elem and "auto.ria.com" in link_elem.get("href", ""):
+                            href = link_elem.get("href")
+                            # Витягуємо цифри з посилання як унікальний ID авто
+                            parts = href.split("_")
+                            if parts:
+                                car_id = ''.join(filter(str.isdigit, parts[-1]))
+                    
+                    if not car_id:
                         continue
-                    title_elem = section.find("a", class_="address")
-                    price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket")
+
+                    title_elem = section.find("a", class_="address") or section.find("a", class_="m-link")
+                    price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket") or section.find("strong", class_="bold")
 
                     title = title_elem.text.strip() if title_elem else "Автомобіль"
                     price = price_elem.text.strip() if price_elem else "Ціну не вказано"
                     link = title_elem.get("href") if title_elem else ""
+                    if link and not link.startswith("http"):
+                        link = "https://auto.ria.com" + link
 
                     cars.append({
                         "car_id": str(car_id),
@@ -174,13 +170,12 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
                         "link": link
                     })
                 except Exception as e:
-                    # Одне криве оголошення більше не валить весь парсинг сторінки
-                    logging.error(f"Помилка розбору окремого блоку оголошення: {e}")
+                    logging.error(f"Помилка розбору окремої картки авто: {e}")
                     continue
 
             return cars
     except Exception as e:
-        logging.error(f"Помилка парсингу {url}: {e}")
+        logging.error(f"Помилка запиту до Auto.ria для {url}: {e}")
         return []
 
 
@@ -203,7 +198,7 @@ async def start(msg: types.Message):
             "INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
             msg.from_user.id, datetime.now() + timedelta(days=1)
         )
-
+    
     await msg.answer(
         "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
         "Надішли мені посилання на пошук з Auto.ria, і я миттєво сповіщатиму тебе про нові оголошення!",
@@ -260,7 +255,7 @@ async def show_filters(msg: types.Message):
 
     async with db_pool.acquire() as conn:
         filters = await conn.fetch("SELECT id, url FROM user_filters WHERE user_id = $1", msg.from_user.id)
-
+    
     if not filters:
         await msg.answer("У вас немає збережених фільтрів. Натисніть «➕ Додати посилання».")
         return
@@ -334,19 +329,15 @@ async def add_filter(msg: types.Message):
 
         if current_cars:
             await processing_msg.edit_text(
-                "✅ **Посилання успішно збережено в базі даних!**\n"
-                f"Поточні оголошення зафіксовано: <b>{len(current_cars)}</b> шт.\n"
+                "✅ **Фільтр успішно додано!**\n"
+                f"Зафіксовано поточних оголошень: <b>{len(current_cars)}</b> шт.\n"
                 "Сповіщення прийдуть тільки на <b>нові</b> оголошення.",
                 parse_mode="HTML"
             )
         else:
-            # 0 знайдених авто одразу видно користувачу — не треба лізти в логи,
-            # щоб зрозуміти, що парсер щось не знаходить.
             await processing_msg.edit_text(
-                "⚠️ **Посилання збережено, але зараз по ньому знайдено 0 оголошень.**\n"
-                "Або по фільтру справді немає авто, або сайт тимчасово заблокував запит "
-                "(антибот-захист/капча). Спробуйте команду /debug з цим посиланням трохи пізніше, "
-                "щоб перевірити.",
+                "⚠️ **Посилання збережено, але парсер не зміг знайти картки авто.**\n"
+                "Спробуйте перевірити його командою `/debug <посилання>`.",
                 parse_mode="HTML"
             )
     except Exception as e:
@@ -359,12 +350,12 @@ async def add_filter(msg: types.Message):
 async def grant_subscription(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-
+    
     args = msg.text.split()
     if len(args) < 3:
         await msg.answer("Формат: `/grant user_id days`", parse_mode="Markdown")
         return
-
+    
     target_user_id = int(args[1])
     days = int(args[2])
     new_expire = datetime.now() + timedelta(days=days)
@@ -381,11 +372,6 @@ async def grant_subscription(msg: types.Message):
 
 @dp.message(Command("debug"))
 async def debug_parse(msg: types.Message):
-    """
-    Тільки для адміна. Дозволяє протестувати парсинг конкретного посилання
-    прямо з Telegram, без перезапуску сервера і без копання в логах.
-    Використання: /debug https://auto.ria.com/uk/search/?...
-    """
     if msg.from_user.id != ADMIN_ID:
         return
 
@@ -397,19 +383,18 @@ async def debug_parse(msg: types.Message):
     raw_url = parts[1].strip()
     url = normalize_autoria_url(raw_url)
 
-    wait_msg = await msg.answer(f"⏳ Перевіряю:\n`{html.escape(url)}`", parse_mode="Markdown")
+    wait_msg = await msg.answer(f"⏳ Тестую парсинг:\n`{html.escape(url)}`", parse_mode="Markdown")
     cars = await parse_autoria(http_session, url)
 
     if cars:
         preview = "\n".join(f"• {c['title']} — {c['price']}" for c in cars[:5])
         await wait_msg.edit_text(
-            f"✅ Знайдено оголошень: <b>{len(cars)}</b>\n\nПерші кілька:\n{html.escape(preview)}",
+            f"✅ Успішно! Знайдено оголошень: <b>{len(cars)}</b>\n\nПерші кілька:\n{html.escape(preview)}",
             parse_mode="HTML"
         )
     else:
         await wait_msg.edit_text(
-            "⚠️ Знайдено 0 оголошень. Дивись логи бота (там я пишу статус-код і шматок HTML) — "
-            "це або антибот-захист/капча, або верстка сторінки змінилась.",
+            "⚠️ Знайдено 0 оголошень. Сайт міг віддати порожню сторінку через захист хмарного хостингу."
         )
 
 
@@ -422,7 +407,7 @@ async def monitor():
 
             for f in filters:
                 user_id = f["user_id"]
-
+                
                 if not await check_subscription(user_id):
                     continue
 
@@ -440,7 +425,7 @@ async def monitor():
                         safe_title = html.escape(car["title"])
                         safe_price = html.escape(car["price"])
                         safe_link = html.escape(car["link"], quote=True)
-
+                        
                         msg_text = (
                             f"🚗 <b>Нове оголошення!</b>\n\n"
                             f"📌 <b>{safe_title}</b>\n"
