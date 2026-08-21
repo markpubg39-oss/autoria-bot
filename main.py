@@ -1,5 +1,5 @@
 """
-Auto.ria Monitor Bot — Production Ready (Direct Parsing Fix)
+Auto.ria Monitor Bot — Production Ready (Resilient Multi-Strategy Parser)
 """
 
 import asyncio
@@ -11,7 +11,7 @@ import random
 import re
 from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse, unquote
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote
 
 import aiohttp
 import asyncpg
@@ -42,7 +42,7 @@ if DATABASE_URL.startswith("postgres://"):
 
 PROXY_URL = os.getenv("PROXY_URL") or None
 
-PARSE_RETRIES = int(os.getenv("PARSE_RETRIES", "3"))
+PARSE_RETRIES = int(os.getenv("PARSE_RETRIES", "4"))
 PARSE_TIMEOUT = int(os.getenv("PARSE_TIMEOUT", "25"))
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
 PARSE_CONCURRENCY = int(os.getenv("PARSE_CONCURRENCY", "3"))
@@ -59,6 +59,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 ]
 
 _CHALLENGE_MARKERS = (
@@ -71,12 +73,13 @@ _CHALLENGE_MARKERS = (
     "перевірка браузера",
     "проверка браузера",
     "checking your browser",
+    "ddos-guard",
 )
 
 
-def build_headers() -> dict:
+def build_headers(force_ua: Optional[str] = None) -> dict:
     return {
-        "User-Agent": random.choice(USER_AGENTS),
+        "User-Agent": force_ua or random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "gzip, deflate",
@@ -96,6 +99,7 @@ http_session: Optional[aiohttp.ClientSession] = None
 
 
 def normalize_autoria_url(raw_url: str) -> str:
+    """Бере посилання користувача як є і лише примусово додає сортування за датою + скидає page/order."""
     try:
         parsed = urlparse(raw_url)
         pairs = [
@@ -113,7 +117,7 @@ def normalize_autoria_url(raw_url: str) -> str:
 
 
 # ============================================================
-#               УНІВЕРСАЛЬНИЙ ПАРСЕР ТА БУДІВНИК URL AUTO.RIA
+#               ПАРСЕР ФІЛЬТРІВ (для гарного відображення)
 # ============================================================
 
 _COMPOUND_ALIASES = {
@@ -171,7 +175,6 @@ _IGNORED_TOP_LEVEL = {"order", "page", "sort", "countpage", "size", "lang_id", "
 _TOKEN_RE = re.compile(r'([^\[\].]+)(?:\[(\d*)\])?')
 
 _CURRENCY_MAP = {1: "USD", 2: "UAH", 3: "EUR"}
-_CURRENCY_TO_CODE = {"USD": "1", "UAH": "2", "EUR": "3"}
 
 
 def _deep_unquote(s: str) -> str:
@@ -206,21 +209,12 @@ def _to_number(value: str):
 
 def parse_autoria_url(url: str) -> dict:
     result = {
-        "brand_id": [],
-        "model_id": [],
-        "price_min": None,
-        "price_max": None,
-        "price_currency": None,
-        "year_min": None,
-        "year_max": None,
-        "mileage_min": None,
-        "mileage_max": None,
-        "body_type": [],
-        "gearbox": [],
-        "fuel_type": [],
-        "region": [],
-        "city": [],
-        "customs": [],
+        "brand_id": [], "model_id": [],
+        "price_min": None, "price_max": None, "price_currency": None,
+        "year_min": None, "year_max": None,
+        "mileage_min": None, "mileage_max": None,
+        "body_type": [], "gearbox": [], "fuel_type": [],
+        "region": [], "city": [], "customs": [],
         "extra": {},
     }
 
@@ -449,6 +443,8 @@ def format_car_notification(car: dict) -> str:
 
 
 async def send_car_notification(user_id: int, car: dict) -> bool:
+    """Надсилає сповіщення. Повертає True лише при підтвердженій успішній доставці —
+    саме на цьому базується запис car_id у sent_cars (щоб при збої не втратити оголошення назавжди)."""
     caption = format_car_notification(car)
     image_url = car.get("image")
 
@@ -479,35 +475,77 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
 
 
 # ============================================================
-#                           ПАРСИНГ
+#                           ПАРСИНГ HTML
 # ============================================================
 
-def _extract_cars_from_html(html_text: str) -> list:
-    soup = BeautifulSoup(html_text, "html.parser")
-    sections = soup.select('section.ticket-item, div.ticket-item, div[data-good-id], div.search-result-item, section.item-ticket')
+_ID_FROM_HREF_RE = re.compile(r'/auto_[^"/?]*?_(\d{6,})\.html', re.IGNORECASE)
+_ID_ANY_RE = re.compile(r'(\d{6,})\.html')
+
+
+def _extract_id_from_href(href: str) -> Optional[str]:
+    if not href:
+        return None
+    m = _ID_FROM_HREF_RE.search(href)
+    if m:
+        return m.group(1)
+    m = _ID_ANY_RE.search(href)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _normalize_image(src: Optional[str]) -> Optional[str]:
+    if not src:
+        return None
+    src = src.strip()
+    if not src or src.startswith("data:"):
+        return None
+    if src.startswith("//"):
+        return "https:" + src
+    if src.startswith("/"):
+        return "https://auto.ria.com" + src
+    return src
+
+
+def _extract_via_dom(soup: BeautifulSoup) -> list:
+    """Стратегія 1: звичайні картки оголошень у DOM (найточніша, коли верстка стандартна)."""
+    sections = soup.select(
+        'section.ticket-item, div.ticket-item, section.item-ticket, '
+        'div[data-good-id], div.search-result-item, '
+        'div[data-marker="list-item"], article[data-id], '
+        'section[data-id][data-good-id], div.content-bar'
+    )
 
     cars = []
     for section in sections:
         try:
-            car_id = section.get("data-id") or section.get("data-good-id") or section.get("data-item-id")
-            
+            car_id = (
+                section.get("data-id")
+                or section.get("data-good-id")
+                or section.get("data-item-id")
+                or section.get("data-advertisement-id")
+            )
+
             title_elem = (
-                section.find("a", class_="address") 
-                or section.find("a", class_="m-link") 
+                section.find("a", class_="address")
+                or section.find("a", class_="m-link")
                 or section.select_one('a[href*="/auto_"]')
+                or section.select_one('a.styles-item__title, a.item__title')
                 or section.find("a", href=True)
             )
 
-            if not car_id and title_elem:
-                href = title_elem.get("href", "")
-                if "/auto_" in href or "auto.ria.com" in href:
-                    match = re.search(r'_(\d+)\.html', href)
-                    if match:
-                        car_id = match.group(1)
-                    else:
-                        parts = href.split("_")
-                        if parts:
-                            car_id = ''.join(filter(str.isdigit, parts[-1]))
+            href = title_elem.get("href", "") if title_elem else ""
+            if not car_id and href:
+                car_id = _extract_id_from_href(href)
+
+            if not car_id:
+                # остання спроба: пошукати будь-яке посилання /auto_ всередині картки
+                any_link = section.select_one('a[href*="/auto_"], a[href*=".html"]')
+                if any_link:
+                    car_id = _extract_id_from_href(any_link.get("href", ""))
+                    if not title_elem:
+                        title_elem = any_link
+                        href = any_link.get("href", "")
 
             if not car_id:
                 continue
@@ -518,26 +556,32 @@ def _extract_cars_from_html(html_text: str) -> list:
                 or section.find("strong", class_="bold")
                 or section.select_one('.price-color')
                 or section.select_one('[data-currency]')
+                or section.select_one('.price')
             )
 
-            title = " ".join((title_elem.text if title_elem else "Автомобіль").split())
-            price = " ".join((price_elem.text if price_elem else "Ціну не вказано").split())
+            title = " ".join((title_elem.get_text() if title_elem else "Автомобіль").split())
+            price = " ".join((price_elem.get_text() if price_elem else "Ціну не вказано").split())
 
-            link = title_elem.get("href") if title_elem else ""
+            link = href
             if link and not link.startswith("http"):
-                link = "https://auto.ria.com" + link
+                link = "https://auto.ria.com" + link if link.startswith("/") else link
 
             image = None
             img_elem = section.find("img")
             if img_elem:
-                image = img_elem.get("src") or img_elem.get("data-src") or img_elem.get("data-lazy")
-                if image and image.startswith("//"):
-                    image = "https:" + image
+                image = _normalize_image(
+                    img_elem.get("src") or img_elem.get("data-src")
+                    or img_elem.get("data-lazy") or img_elem.get("data-original")
+                )
+            if not image:
+                picture_source = section.find("source")
+                if picture_source:
+                    image = _normalize_image(picture_source.get("srcset") or picture_source.get("data-srcset"))
 
             cars.append({
                 "car_id": str(car_id),
-                "title": title,
-                "price": price,
+                "title": title or "Автомобіль",
+                "price": price or "Ціну не вказано",
                 "link": link,
                 "image": image,
             })
@@ -546,13 +590,145 @@ def _extract_cars_from_html(html_text: str) -> list:
     return cars
 
 
+def _extract_via_jsonld(soup: BeautifulSoup) -> list:
+    """Стратегія 2: JSON-LD (schema.org) блоки — Auto.ria часто дублює дані оголошень туди
+    навіть коли звичайна DOM-верстка нестандартна чи прихована через JS-рендер."""
+    cars = []
+
+    def _walk(node):
+        if isinstance(node, dict):
+            node_type = str(node.get("@type", "")).lower()
+            url_val = node.get("url") or node.get("@id")
+            if node_type in ("car", "product", "vehicle") or (url_val and "/auto_" in str(url_val)):
+                href = url_val or ""
+                car_id = _extract_id_from_href(str(href))
+                if car_id:
+                    name = node.get("name") or "Автомобіль"
+                    offers = node.get("offers") or {}
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    price_val = None
+                    if isinstance(offers, dict):
+                        price_val = offers.get("price") or offers.get("priceSpecification", {}).get("price")
+                        currency = offers.get("priceCurrency", "")
+                    else:
+                        currency = ""
+                    price = f"{price_val} {currency}".strip() if price_val else "Ціну не вказано"
+                    image = node.get("image")
+                    if isinstance(image, list):
+                        image = image[0] if image else None
+                    link = str(href)
+                    if link and not link.startswith("http"):
+                        link = "https://auto.ria.com" + link
+                    cars.append({
+                        "car_id": str(car_id),
+                        "title": " ".join(str(name).split()),
+                        "price": price,
+                        "link": link,
+                        "image": _normalize_image(image) if image else None,
+                    })
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or script.get_text() or "{}")
+        except Exception:
+            continue
+        _walk(data)
+
+    return cars
+
+
+_JSON_ID_BLOCK_RE = re.compile(
+    r'"(?:advertisementId|adId|id)"\s*:\s*(\d{6,})[^}]{0,600}?'
+    r'(?:"title"\s*:\s*"([^"]{0,200})")?',
+    re.IGNORECASE,
+)
+
+
+def _extract_via_regex_fallback(html_text: str) -> list:
+    """Стратегія 3: сировинний regex по HTML/inline-JSON стану сторінки.
+    Використовується лише як останній рубіж, щоб хоч не пропустити нові ID."""
+    cars = {}
+
+    for m in re.finditer(r'href="([^"]*?/auto_[^"]*?_(\d{6,})\.html[^"]*)"', html_text):
+        href, car_id = m.group(1), m.group(2)
+        if car_id in cars:
+            continue
+        link = href if href.startswith("http") else "https://auto.ria.com" + href
+        cars[car_id] = {
+            "car_id": car_id,
+            "title": "Автомобіль",
+            "price": "Ціну не вказано",
+            "link": link,
+            "image": None,
+        }
+
+    for m in _JSON_ID_BLOCK_RE.finditer(html_text):
+        car_id, title = m.group(1), m.group(2)
+        if car_id not in cars:
+            cars[car_id] = {
+                "car_id": car_id,
+                "title": " ".join(title.split()) if title else "Автомобіль",
+                "price": "Ціну не вказано",
+                "link": f"https://auto.ria.com/uk/auto_{car_id}.html",
+                "image": None,
+            }
+        elif title and cars[car_id]["title"] == "Автомобіль":
+            cars[car_id]["title"] = " ".join(title.split())
+
+    return list(cars.values())
+
+
+def _extract_cars_from_html(html_text: str) -> list:
+    """Об'єднує усі стратегії видобутку та дедуплікує за car_id.
+    Пріоритет даних (title/price/image): DOM > JSON-LD > regex-fallback."""
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    merged: dict = {}
+
+    for strategy in (_extract_via_dom, _extract_via_jsonld):
+        try:
+            for car in strategy(soup):
+                cid = car["car_id"]
+                if cid not in merged:
+                    merged[cid] = car
+                else:
+                    # доповнюємо відсутні поля, не затираючи вже знайдені якісні дані
+                    for key in ("title", "price", "link", "image"):
+                        if not merged[cid].get(key) or merged[cid][key] in ("Автомобіль", "Ціну не вказано"):
+                            if car.get(key):
+                                merged[cid][key] = car[key]
+        except Exception as e:
+            logging.warning(f"Стратегія парсингу {strategy.__name__} впала: {type(e).__name__}: {e}")
+
+    if not merged:
+        try:
+            for car in _extract_via_regex_fallback(html_text):
+                merged.setdefault(car["car_id"], car)
+        except Exception as e:
+            logging.warning(f"Regex fallback впав: {type(e).__name__}: {e}")
+
+    return list(merged.values())
+
+
 async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     last_error: Optional[Exception] = None
+    used_agents: list = []
 
     for attempt in range(1, PARSE_RETRIES + 1):
         try:
+            # гарантуємо, що кожна повторна спроба йде з новим User-Agent (bypass 0 cars)
+            available_agents = [ua for ua in USER_AGENTS if ua not in used_agents] or USER_AGENTS
+            ua = random.choice(available_agents)
+            used_agents.append(ua)
+
             request_kwargs = dict(
-                headers=build_headers(),
+                headers=build_headers(force_ua=ua),
                 timeout=aiohttp.ClientTimeout(total=PARSE_TIMEOUT),
                 allow_redirects=True,
             )
@@ -565,7 +741,7 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
                 if status in (403, 429):
                     retry_after_header = resp.headers.get("Retry-After")
                     wait = float(retry_after_header) if retry_after_header and retry_after_header.isdigit() else min(8 * attempt, 40)
-                    logging.warning(f"Auto.ria: статус {status} для {url} (спроба {attempt}/{PARSE_RETRIES}), чекаємо {wait:.0f}с")
+                    logging.warning(f"Auto.ria: статус {status} для {url} (спроба {attempt}/{PARSE_RETRIES}), чекаємо {wait:.0f}с, новий UA")
                     last_error = RuntimeError(f"HTTP {status}")
                     await asyncio.sleep(wait)
                     continue
@@ -579,12 +755,20 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
                 html_text = await resp.text()
                 lowered = html_text.lower()
                 if any(marker in lowered for marker in _CHALLENGE_MARKERS):
-                    logging.warning(f"Схоже на CAPTCHA/Cloudflare-сторінку для {url} (спроба {attempt}/{PARSE_RETRIES})")
+                    logging.warning(f"Схоже на CAPTCHA/Cloudflare-сторінку для {url} (спроба {attempt}/{PARSE_RETRIES}), новий UA")
                     last_error = RuntimeError("Captcha/challenge page")
                     await asyncio.sleep(min(6 * attempt, 30))
                     continue
 
-                return _extract_cars_from_html(html_text)
+                cars = _extract_cars_from_html(html_text)
+                if not cars and attempt < PARSE_RETRIES:
+                    # 0 авто теж може бути тимчасовим блокуванням/нестандартною версткою — пробуємо ще раз з іншим UA
+                    logging.info(f"0 авто на спробі {attempt}/{PARSE_RETRIES} для {url} — повтор з іншим User-Agent")
+                    last_error = RuntimeError("0 cars extracted")
+                    await asyncio.sleep(min(4 * attempt, 15))
+                    continue
+
+                return cars
 
         except asyncio.TimeoutError as e:
             last_error = e
@@ -603,11 +787,9 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
 
 async def parse_autoria_smart(session: aiohttp.ClientSession, raw_url: str) -> list:
-    normalized = normalize_autoria_url(raw_url)
-    cars = await parse_autoria(session, normalized)
-    if cars:
-        return cars
-    return await parse_autoria(session, raw_url)
+    """Просто нормалізує URL (сортування за датою) і парсить — без зайвої перебудови посилання клієнта."""
+    normalized_url = normalize_autoria_url(raw_url)
+    return await parse_autoria(session, normalized_url)
 
 
 # ============================================================
@@ -687,7 +869,7 @@ async def show_filters(msg: types.Message):
         return
     for f in filters:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Видалити", callback_data=f"del_{f['id']}")]])
-        text = f"🔗 `{html.escape(f['url'])}`"
+        text = f"🔗 {html.escape(f['url'])}"
         if f["filters_json"]:
             try:
                 parsed = json.loads(f["filters_json"]) if isinstance(f["filters_json"], str) else f["filters_json"]
@@ -716,10 +898,12 @@ async def add_prompt(msg: types.Message):
 
 
 async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> None:
+    normalized_url = normalize_autoria_url(raw_url)
+
     async with db_pool.acquire() as conn:
         already_exists = await conn.fetchval(
             "SELECT 1 FROM user_filters WHERE user_id = $1 AND url = $2",
-            user_id, normalize_autoria_url(raw_url)
+            user_id, normalized_url
         )
         if not already_exists:
             count = await conn.fetchval("SELECT COUNT(*) FROM user_filters WHERE user_id = $1", user_id)
@@ -730,12 +914,13 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
                 )
                 return
 
-    url = normalize_autoria_url(raw_url)
     processing_msg = await msg.answer("⏳ Обробляю посилання...")
 
-    parsed_filters = parse_autoria_url(url)
+    parsed_filters = parse_autoria_url(normalized_url)
     filters_summary = format_filters_summary(parsed_filters)
 
+    # 1) Зберігаємо фільтр у БД одразу — навіть якщо перший парсинг далі не вдасться,
+    #    фоновий monitor() підхопить його в наступному циклі.
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
@@ -743,24 +928,31 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
             VALUES ($1, $2, $3::jsonb)
             ON CONFLICT (user_id, url) DO UPDATE SET filters_json = EXCLUDED.filters_json
             """,
-            user_id, url, json.dumps(parsed_filters, ensure_ascii=False)
+            user_id, normalized_url, json.dumps(parsed_filters, ensure_ascii=False)
         )
 
-    current_cars = await parse_autoria_smart(http_session, url)
+    # 2) Одразу пробуємо зчитати поточні оголошення першої сторінки —
+    #    щоб зафіксувати їх як "прочитані" (baseline) і показати користувачу кількість.
+    current_cars = await parse_autoria_smart(http_session, normalized_url)
+
     if current_cars:
         records = [(user_id, c["car_id"]) for c in current_cars]
         async with db_pool.acquire() as conn:
-            await conn.executemany("INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", records)
+            await conn.executemany(
+                "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                records
+            )
         await processing_msg.edit_text(
             f"✅ <b>Фільтр успішно додано!</b>\n\n{html.escape(filters_summary)}\n\n"
-            f"Знайдено {len(current_cars)} авто. Нові оголошення почнуть надходити.",
+            f"📊 Знайдено {len(current_cars)} авто за поточним фільтром (позначено як переглянуті).\n"
+            f"Нові оголошення надходитимуть автоматично.",
             parse_mode=ParseMode.HTML
         )
     else:
         await processing_msg.edit_text(
-            f"⚠️ <b>Фільтр додано, але зараз не вдалося отримати оголошення з Auto.ria.</b>\n\n"
-            f"{html.escape(filters_summary)}\n\n"
-            f"Спробуємо ще раз під час наступного циклу моніторингу.",
+            f"✅ <b>Фільтр додано і збережено!</b>\n\n{html.escape(filters_summary)}\n\n"
+            f"⚠️ Наразі не вдалося отримати список оголошень з Auto.ria (можливе тимчасове "
+            f"блокування). Моніторинг вже запущено — спробуємо знову у наступному циклі.",
             parse_mode=ParseMode.HTML
         )
 
@@ -816,19 +1008,17 @@ async def _process_filter(sem: asyncio.Semaphore, record) -> None:
             if not new_cars:
                 return
 
-            newly_sent_ids = []
+            # Надсилаємо НЕГАЙНО і фіксуємо в БД лише те, що реально доставлено,
+            # щоб при збої відправки оголошення не загубилось назавжди.
             for car in new_cars:
                 ok = await send_car_notification(user_id, car)
                 if ok:
-                    newly_sent_ids.append(car["car_id"])
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            user_id, car["car_id"]
+                        )
                 await asyncio.sleep(0.5)
-
-            if newly_sent_ids:
-                async with db_pool.acquire() as conn:
-                    await conn.executemany(
-                        "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                        [(user_id, cid) for cid in newly_sent_ids]
-                    )
         except Exception as e:
             logging.error(f"Помилка обробки фільтра user={user_id}: {type(e).__name__}: {e}")
         finally:
