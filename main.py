@@ -443,8 +443,6 @@ def format_car_notification(car: dict) -> str:
 
 
 async def send_car_notification(user_id: int, car: dict) -> bool:
-    """Надсилає сповіщення. Повертає True лише при підтвердженій успішній доставці —
-    саме на цьому базується запис car_id у sent_cars (щоб при збої не втратити оголошення назавжди)."""
     caption = format_car_notification(car)
     image_url = car.get("image")
 
@@ -508,12 +506,13 @@ def _normalize_image(src: Optional[str]) -> Optional[str]:
 
 
 def _extract_via_dom(soup: BeautifulSoup) -> list:
-    """Стратегія 1: звичайні картки оголошень у DOM (найточніша, коли верстка стандартна)."""
+    """Стратегія 1: DOM парсинг з розширеними селекторами ціни та заголовків."""
     sections = soup.select(
         'section.ticket-item, div.ticket-item, section.item-ticket, '
         'div[data-good-id], div.search-result-item, '
         'div[data-marker="list-item"], article[data-id], '
-        'section[data-id][data-good-id], div.content-bar'
+        'section[data-id][data-good-id], div.content-bar, '
+        'div.ticket-status'
     )
 
     cars = []
@@ -527,10 +526,12 @@ def _extract_via_dom(soup: BeautifulSoup) -> list:
             )
 
             title_elem = (
-                section.find("a", class_="address")
-                or section.find("a", class_="m-link")
+                section.select_one('a.address')
+                or section.select_one('a.m-link')
+                or section.select_one('a.blue.bold')
+                or section.select_one('span.blue.bold')
+                or section.select_one('.head-ticket a')
                 or section.select_one('a[href*="/auto_"]')
-                or section.select_one('a.styles-item__title, a.item__title')
                 or section.find("a", href=True)
             )
 
@@ -539,7 +540,6 @@ def _extract_via_dom(soup: BeautifulSoup) -> list:
                 car_id = _extract_id_from_href(href)
 
             if not car_id:
-                # остання спроба: пошукати будь-яке посилання /auto_ всередині картки
                 any_link = section.select_one('a[href*="/auto_"], a[href*=".html"]')
                 if any_link:
                     car_id = _extract_id_from_href(any_link.get("href", ""))
@@ -551,16 +551,21 @@ def _extract_via_dom(soup: BeautifulSoup) -> list:
                 continue
 
             price_elem = (
-                section.find("span", class_="size22")
-                or section.find("span", class_="price-ticket")
-                or section.find("strong", class_="bold")
-                or section.select_one('.price-color')
+                section.select_one('.price-ticket[data-currency="USD"]')
+                or section.select_one('.price-ticket')
+                or section.select_one('span.size22.green')
+                or section.select_one('span.size22')
+                or section.select_one('.green.bold')
+                or section.select_one('span.price')
                 or section.select_one('[data-currency]')
-                or section.select_one('.price')
+                or section.select_one('.price-color')
             )
 
-            title = " ".join((title_elem.get_text() if title_elem else "Автомобіль").split())
-            price = " ".join((price_elem.get_text() if price_elem else "Ціну не вказано").split())
+            title_text = title_elem.get_text(strip=True) if title_elem else ""
+            price_text = price_elem.get_text(strip=True) if price_elem else ""
+
+            title = " ".join(title_text.split()) if title_text else "Автомобіль"
+            price = " ".join(price_text.split()) if price_text else "Ціну не вказано"
 
             link = href
             if link and not link.startswith("http"):
@@ -580,8 +585,8 @@ def _extract_via_dom(soup: BeautifulSoup) -> list:
 
             cars.append({
                 "car_id": str(car_id),
-                "title": title or "Автомобіль",
-                "price": price or "Ціну не вказано",
+                "title": title,
+                "price": price,
                 "link": link,
                 "image": image,
             })
@@ -591,8 +596,6 @@ def _extract_via_dom(soup: BeautifulSoup) -> list:
 
 
 def _extract_via_jsonld(soup: BeautifulSoup) -> list:
-    """Стратегія 2: JSON-LD (schema.org) блоки — Auto.ria часто дублює дані оголошень туди
-    навіть коли звичайна DOM-верстка нестандартна чи прихована через JS-рендер."""
     cars = []
 
     def _walk(node):
@@ -651,8 +654,6 @@ _JSON_ID_BLOCK_RE = re.compile(
 
 
 def _extract_via_regex_fallback(html_text: str) -> list:
-    """Стратегія 3: сировинний regex по HTML/inline-JSON стану сторінки.
-    Використовується лише як останній рубіж, щоб хоч не пропустити нові ID."""
     cars = {}
 
     for m in re.finditer(r'href="([^"]*?/auto_[^"]*?_(\d{6,})\.html[^"]*)"', html_text):
@@ -685,10 +686,7 @@ def _extract_via_regex_fallback(html_text: str) -> list:
 
 
 def _extract_cars_from_html(html_text: str) -> list:
-    """Об'єднує усі стратегії видобутку та дедуплікує за car_id.
-    Пріоритет даних (title/price/image): DOM > JSON-LD > regex-fallback."""
     soup = BeautifulSoup(html_text, "html.parser")
-
     merged: dict = {}
 
     for strategy in (_extract_via_dom, _extract_via_jsonld):
@@ -698,7 +696,6 @@ def _extract_cars_from_html(html_text: str) -> list:
                 if cid not in merged:
                     merged[cid] = car
                 else:
-                    # доповнюємо відсутні поля, не затираючи вже знайдені якісні дані
                     for key in ("title", "price", "link", "image"):
                         if not merged[cid].get(key) or merged[cid][key] in ("Автомобіль", "Ціну не вказано"):
                             if car.get(key):
@@ -722,7 +719,6 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
     for attempt in range(1, PARSE_RETRIES + 1):
         try:
-            # гарантуємо, що кожна повторна спроба йде з новим User-Agent (bypass 0 cars)
             available_agents = [ua for ua in USER_AGENTS if ua not in used_agents] or USER_AGENTS
             ua = random.choice(available_agents)
             used_agents.append(ua)
@@ -762,7 +758,6 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
                 cars = _extract_cars_from_html(html_text)
                 if not cars and attempt < PARSE_RETRIES:
-                    # 0 авто теж може бути тимчасовим блокуванням/нестандартною версткою — пробуємо ще раз з іншим UA
                     logging.info(f"0 авто на спробі {attempt}/{PARSE_RETRIES} для {url} — повтор з іншим User-Agent")
                     last_error = RuntimeError("0 cars extracted")
                     await asyncio.sleep(min(4 * attempt, 15))
@@ -787,7 +782,6 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
 
 async def parse_autoria_smart(session: aiohttp.ClientSession, raw_url: str) -> list:
-    """Просто нормалізує URL (сортування за датою) і парсить — без зайвої перебудови посилання клієнта."""
     normalized_url = normalize_autoria_url(raw_url)
     return await parse_autoria(session, normalized_url)
 
@@ -919,33 +913,31 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
     parsed_filters = parse_autoria_url(normalized_url)
     filters_summary = format_filters_summary(parsed_filters)
 
-    # 1) Зберігаємо фільтр у БД одразу — навіть якщо перший парсинг далі не вдасться,
-    #    фоновий monitor() підхопить його в наступному циклі.
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO user_filters (user_id, url, filters_json)
-            VALUES ($1, $2, $3::jsonb)
-            ON CONFLICT (user_id, url) DO UPDATE SET filters_json = EXCLUDED.filters_json
-            """,
-            user_id, normalized_url, json.dumps(parsed_filters, ensure_ascii=False)
-        )
-
-    # 2) Одразу пробуємо зчитати поточні оголошення першої сторінки —
-    #    щоб зафіксувати їх як "прочитані" (baseline) і показати користувачу кількість.
     current_cars = await parse_autoria_smart(http_session, normalized_url)
 
-    if current_cars:
-        records = [(user_id, c["car_id"]) for c in current_cars]
-        async with db_pool.acquire() as conn:
-            await conn.executemany(
-                "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                records
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            if current_cars:
+                baseline_records = [(user_id, c["car_id"]) for c in current_cars]
+                await conn.executemany(
+                    "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    baseline_records
+                )
+            await conn.execute(
+                """
+                INSERT INTO user_filters (user_id, url, filters_json)
+                VALUES ($1, $2, $3::jsonb)
+                ON CONFLICT (user_id, url) DO UPDATE SET filters_json = EXCLUDED.filters_json
+                """,
+                user_id, normalized_url, json.dumps(parsed_filters, ensure_ascii=False)
             )
+
+    if current_cars:
         await processing_msg.edit_text(
             f"✅ <b>Фільтр успішно додано!</b>\n\n{html.escape(filters_summary)}\n\n"
-            f"📊 Знайдено {len(current_cars)} авто за поточним фільтром (позначено як переглянуті).\n"
-            f"Нові оголошення надходитимуть автоматично.",
+            f"📊 Знайдено {len(current_cars)} авто за поточним фільтром — усі вони зафіксовані "
+            f"як вже переглянуті (baseline).\n"
+            f"Тепер бот надсилатиме виключно НОВІ оголошення, які з'являться після цього моменту.",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -1008,8 +1000,6 @@ async def _process_filter(sem: asyncio.Semaphore, record) -> None:
             if not new_cars:
                 return
 
-            # Надсилаємо НЕГАЙНО і фіксуємо в БД лише те, що реально доставлено,
-            # щоб при збої відправки оголошення не загубилось назавжди.
             for car in new_cars:
                 ok = await send_car_notification(user_id, car)
                 if ok:
