@@ -947,16 +947,10 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
     parsed_filters = parse_autoria_url(normalized_url)
     filters_summary = format_filters_summary(parsed_filters)
 
-    current_cars = await parse_autoria_smart(http_session, normalized_url)
-
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            if current_cars:
-                baseline_records = [(user_id, c["car_id"]) for c in current_cars]
-                await conn.executemany(
-                    "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    baseline_records
-                )
+    # --- Крок 1: ОБОВ'ЯЗКОВО зберігаємо сам фільтр. Це критична дія, яка не повинна
+    #             залежати від того, чи вдасться парсинг оголошень нижче. ---
+    try:
+        async with db_pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO user_filters (user_id, url, filters_json)
@@ -964,6 +958,44 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
                 ON CONFLICT (user_id, url) DO UPDATE SET filters_json = EXCLUDED.filters_json
                 """,
                 user_id, normalized_url, json.dumps(parsed_filters, ensure_ascii=False)
+            )
+    except Exception as e:
+        logging.error(
+            f"Критична помилка збереження фільтра user={user_id} url={normalized_url}: "
+            f"{type(e).__name__}: {e}"
+        )
+        await processing_msg.edit_text(
+            "❌ Не вдалося зберегти фільтр через помилку бази даних. Спробуйте, будь ласка, ще раз трохи пізніше."
+        )
+        return  # без збереженого фільтра йти далі немає сенсу
+
+    # --- Крок 2: намагаємось отримати поточні оголошення для baseline.
+    #             Будь-яка помилка тут НЕ повинна зачіпати вже збережений фільтр. ---
+    current_cars = []
+    try:
+        current_cars = await parse_autoria_smart(http_session, normalized_url)
+    except Exception as e:
+        logging.error(
+            f"Помилка парсингу оголошень при додаванні фільтра user={user_id} url={normalized_url}: "
+            f"{type(e).__name__}: {e}"
+        )
+        current_cars = []
+
+    # --- Крок 3: baseline у sent_cars — теж окрема, некритична дія. Якщо впаде,
+    #             фільтр все одно вже збережено; просто в наступному циклі моніторингу
+    #             користувач може отримати повторно вже наявні на сайті оголошення. ---
+    if current_cars:
+        try:
+            baseline_records = [(user_id, c["car_id"]) for c in current_cars]
+            async with db_pool.acquire() as conn:
+                await conn.executemany(
+                    "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    baseline_records
+                )
+        except Exception as e:
+            logging.error(
+                f"Помилка запису baseline sent_cars user={user_id} url={normalized_url}: "
+                f"{type(e).__name__}: {e}"
             )
 
     if current_cars:
