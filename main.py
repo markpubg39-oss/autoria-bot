@@ -430,14 +430,10 @@ async def check_subscription(user_id: int) -> bool:
 # ============================================================
 
 def format_car_notification(car: dict) -> str:
-    lines = [
-        "🚗 <b>Нове оголошення!</b>",
-        "",
-        f"📌 <b>{html.escape(car.get('title') or 'Автомобіль')}</b>",
-        f"💰 <b>Ціна:</b> {html.escape(car.get('price') or 'не вказано')}",
+   lines = [
+        "🚗 <b>Знайдено нове оголошення!</b>",
     ]
     if car.get("link"):
-        lines.append("")
         lines.append(f'🔗 <a href="{html.escape(car["link"], quote=True)}">Переглянути на Auto.ria</a>')
     return "\n".join(lines)
 
