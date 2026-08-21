@@ -1,5 +1,5 @@
 """
-Auto.ria Monitor Bot — Full Production Release with Clean URL Builder & Fallback
+Auto.ria Monitor Bot — Production Ready (Direct Parsing Fix)
 """
 
 import asyncio
@@ -96,9 +96,6 @@ http_session: Optional[aiohttp.ClientSession] = None
 
 
 def normalize_autoria_url(raw_url: str) -> str:
-    """
-    Примусово додає параметри сортування "найновіші спочатку" до будь-якого посилання.
-    """
     try:
         parsed = urlparse(raw_url)
         pairs = [
@@ -235,7 +232,7 @@ def parse_autoria_url(url: str) -> dict:
         parsed = urlparse(clean_url)
         pairs = parse_qsl(parsed.query, keep_blank_values=False)
     except Exception as e:
-        logging.error(f"parse_autoria_url error: {e}")
+        logging.error(f"parse_autoria_url: не вдалось розпарсити URL '{url}': {e}")
         return result
 
     for raw_key, raw_value in pairs:
@@ -340,60 +337,10 @@ def parse_autoria_url(url: str) -> dict:
             result[f"{field}_{bound}"] = number_value
 
         except Exception as e:
-            logging.warning(f"parse_autoria_url: skipped '{raw_key}'={raw_value!r}: {e}")
+            logging.warning(f"parse_autoria_url: пропущено параметр '{raw_key}'={raw_value!r}: {e}")
             continue
 
     return result
-
-
-def build_autoria_url(parsed: dict) -> str:
-    """
-    Будує чистий канонічний URL для парсингу з використанням стандартних параметрів.
-    """
-    base_url = "https://auto.ria.com/uk/search/"
-    currency_code = _CURRENCY_TO_CODE.get(parsed.get("price_currency"), "1")
-    query_params = [
-        ("indexName", "auto,order_by,desc"),
-        ("categories.main.id", "1"),
-        ("country.g.id", "218"),
-        ("price.currency", currency_code),
-        ("sort[0].order", "dates.created.desc"),
-        ("search_type", "1"),
-        ("order", "7"),
-        ("page", "0"),
-    ]
-
-    for i, b in enumerate(parsed.get("brand_id", [])):
-        query_params.append((f"brand.id[{i}]", str(b)))
-
-    for i, m in enumerate(parsed.get("model_id", [])):
-        query_params.append((f"model.id[{i}]", str(m)))
-
-    if parsed.get("year_min") is not None:
-        query_params.append(("s_yers[0]", str(parsed["year_min"])))
-    if parsed.get("year_max") is not None:
-        query_params.append(("po_yers[0]", str(parsed["year_max"])))
-
-    if parsed.get("price_min") is not None:
-        query_params.append(("price_ot", str(parsed["price_min"])))
-    if parsed.get("price_max") is not None:
-        query_params.append(("price_do", str(parsed["price_max"])))
-
-    if parsed.get("mileage_min") is not None:
-        query_params.append(("raceFrom", str(parsed["mileage_min"])))
-    if parsed.get("mileage_max") is not None:
-        query_params.append(("raceTo", str(parsed["mileage_max"])))
-
-    for i, bt in enumerate(parsed.get("body_type", [])):
-        query_params.append((f"body_style[{i}]", str(bt)))
-    for i, g in enumerate(parsed.get("gearbox", [])):
-        query_params.append((f"gearbox[{i}]", str(g)))
-    for i, ft in enumerate(parsed.get("fuel_type", [])):
-        query_params.append((f"type[{i}]", str(ft)))
-    for i, r in enumerate(parsed.get("region", [])):
-        query_params.append((f"region.id[{i}]", str(r)))
-
-    return f"{base_url}?{urlencode(query_params)}"
 
 
 _FIELD_LABELS_UK = {
@@ -429,7 +376,7 @@ def format_filters_summary(parsed: dict) -> str:
         lines.append(f"🛣️ Пробіг: {mileage_min if mileage_min is not None else '—'} — {mileage_max if mileage_max is not None else '—'} тис. км")
 
     if not lines:
-        return "ℹ️ За цим посиланням застосовано загальний моніторинг."
+        return "ℹ️ Не вдалося розпізнати конкретні фільтри в посиланні — воно оброблятиметься як є."
 
     return "\n".join(lines)
 
@@ -537,7 +484,7 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
 
 def _extract_cars_from_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "html.parser")
-    sections = soup.select('section.ticket-item, div.ticket-item, div[data-good-id], div.search-result-item, section.item-ticket, div.content-bar')
+    sections = soup.select('section.ticket-item, div.ticket-item, div[data-good-id], div.search-result-item, section.item-ticket')
 
     cars = []
     for section in sections:
@@ -632,8 +579,8 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
                 html_text = await resp.text()
                 lowered = html_text.lower()
                 if any(marker in lowered for marker in _CHALLENGE_MARKERS):
-                    logging.warning(f"Схоже на CAPTCHA/Cloudflare для {url} (спроба {attempt}/{PARSE_RETRIES})")
-                    last_error = RuntimeError("Captcha page")
+                    logging.warning(f"Схоже на CAPTCHA/Cloudflare-сторінку для {url} (спроба {attempt}/{PARSE_RETRIES})")
+                    last_error = RuntimeError("Captcha/challenge page")
                     await asyncio.sleep(min(6 * attempt, 30))
                     continue
 
@@ -644,10 +591,10 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
             logging.error(f"Таймаут запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {url}")
         except aiohttp.ClientError as e:
             last_error = e
-            logging.error(f"Мережева помилка (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
+            logging.error(f"Мережева помилка запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
         except Exception as e:
             last_error = e
-            logging.error(f"Неочікувана помилка (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
+            logging.error(f"Неочікувана помилка парсингу (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
 
         await asyncio.sleep(1.5 * attempt + random.uniform(0, 1.5))
 
@@ -656,18 +603,11 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
 
 async def parse_autoria_smart(session: aiohttp.ClientSession, raw_url: str) -> list:
-    normalized_raw = normalize_autoria_url(raw_url)
-    parsed_filters = parse_autoria_url(normalized_raw)
-    canonical_url = build_autoria_url(parsed_filters)
-
-    # 1. Пробуємо зчитати через канонічний URL
-    cars = await parse_autoria(session, canonical_url)
+    normalized = normalize_autoria_url(raw_url)
+    cars = await parse_autoria(session, normalized)
     if cars:
         return cars
-
-    # 2. Якщо канонічний повернув 0 — fallback на оригінальне посилання (з збереженням сортування)
-    logging.info("Канонічний URL повернув 0 авто, робимо fallback на оригінальне посилання.")
-    return await parse_autoria(session, normalized_raw)
+    return await parse_autoria(session, raw_url)
 
 
 # ============================================================
@@ -693,7 +633,9 @@ async def start(msg: types.Message):
         )
     await msg.answer(
         "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
-        "Надішли мені посилання на пошук з Auto.ria, і я сповіщатиму тебе про нові оголошення!",
+        "Надішли мені посилання на пошук з Auto.ria (з телефону чи з компʼютера, "
+        "будь-яке — я сам приведу його до потрібного вигляду), і я сповіщатиму тебе "
+        "про нові оголошення!",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -703,9 +645,9 @@ async def start(msg: types.Message):
 async def help_cmd(msg: types.Message):
     await msg.answer(
         "ℹ️ <b>Як користуватись:</b>\n\n"
-        "1️⃣ Знайди потрібні авто на auto.ria.com з фільтрами\n"
+        "1️⃣ Знайди потрібні авто на auto.ria.com з фільтрами (марка, ціна, рік тощо)\n"
         "2️⃣ Скопіюй посилання і надішли його сюди\n"
-        "3️⃣ Бот сам почне моніторити нові оголошення\n\n"
+        "3️⃣ Бот сам почне моніторити нові оголошення за цим фільтром\n\n"
         f"Можна додати до {MAX_FILTERS_PER_USER} фільтрів одночасно.\n"
         "Керувати фільтрами: «📁 Мої фільтри».",
         parse_mode=ParseMode.HTML,
@@ -774,12 +716,10 @@ async def add_prompt(msg: types.Message):
 
 
 async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> None:
-    url = normalize_autoria_url(raw_url)
-
     async with db_pool.acquire() as conn:
         already_exists = await conn.fetchval(
             "SELECT 1 FROM user_filters WHERE user_id = $1 AND url = $2",
-            user_id, url
+            user_id, normalize_autoria_url(raw_url)
         )
         if not already_exists:
             count = await conn.fetchval("SELECT COUNT(*) FROM user_filters WHERE user_id = $1", user_id)
@@ -790,6 +730,7 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
                 )
                 return
 
+    url = normalize_autoria_url(raw_url)
     processing_msg = await msg.answer("⏳ Обробляю посилання...")
 
     parsed_filters = parse_autoria_url(url)
