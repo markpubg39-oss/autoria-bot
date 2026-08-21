@@ -1,3 +1,31 @@
+"""
+Auto.ria Monitor Bot — production-ready refactor.
+
+ЗМІНИ У ЦЬОМУ РЕФАКТОРИНГУ (порівняно з початковою версією):
+  1. normalize_autoria_url() тепер ЖОРСТКО й надійно форсує сортування
+     "найновіші спочатку" (обидва варіанти параметра: старий order=7
+     і новий sort[0].order=dates.created.desc), незалежно від того,
+     що клієнт мав у посиланні, і видаляє конфліктні старі sort-параметри.
+  2. parse_autoria(): краще розрізнення 403/429 (з повагою до Retry-After),
+     ширший список маркерів Cloudflare/капчі, перевірка на challenge-сторінку
+     виконується ДО спроби витягти авто (а не лише коли cars порожній).
+  3. monitor(): кожен фільтр обробляється в try/except окремо — падіння
+     одного фільтра/користувача більше НЕ ламає весь цикл моніторингу.
+     Додано обмежену паралельність (Semaphore) та пакетну перевірку/запис
+     sent_cars (замість запиту в БД на кожен окремий автомобіль).
+  4. Обробка Telegram-специфічних помилок: TelegramRetryAfter (флуд-контроль)
+     коректно очікується; TelegramForbiddenError (юзер заблокував бота)
+     не спамить в лог і не валить цикл.
+  5. Якщо фоновий таск monitor() все ж впаде — він автоматично
+     перезапускається (watchdog), а не мовчки помирає.
+  6. Ліміт кількості фільтрів на користувача (MAX_FILTERS_PER_USER) —
+     захист від зловживань на безкоштовному/платному тарифі.
+  7. Підтримка кількох посилань в одному повідомленні.
+  8. Гарніші сповіщення (з фото оголошення, якщо вдалось витягти) з
+     fallback на текстове повідомлення, якщо фото не завантажилось.
+  9. Дрібні фікси: EUR у build_autoria_url, індекси в БД, чистіші логи.
+"""
+
 import asyncio
 import html
 import json
@@ -14,10 +42,14 @@ import asyncpg
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
-# === НАЛАШТУВАННЯ ===
+# ============================================================
+#                       НАЛАШТУВАННЯ
+# ============================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Змінна середовища BOT_TOKEN не встановлена!")
@@ -36,6 +68,11 @@ PROXY_URL = os.getenv("PROXY_URL") or None
 
 PARSE_RETRIES = int(os.getenv("PARSE_RETRIES", "3"))
 PARSE_TIMEOUT = int(os.getenv("PARSE_TIMEOUT", "25"))
+MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
+PARSE_CONCURRENCY = int(os.getenv("PARSE_CONCURRENCY", "3"))
+MAX_FILTERS_PER_USER = int(os.getenv("MAX_FILTERS_PER_USER", "5"))
+REQUEST_DELAY_MIN = float(os.getenv("REQUEST_DELAY_MIN", "1.5"))
+REQUEST_DELAY_MAX = float(os.getenv("REQUEST_DELAY_MAX", "3.5"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -47,6 +84,18 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
 ]
+
+_CHALLENGE_MARKERS = (
+    "captcha",
+    "cloudflare",
+    "attention required",
+    "just a moment",
+    "cf-browser-verification",
+    "cf-chl",
+    "перевірка браузера",
+    "проверка браузера",
+    "checking your browser",
+)
 
 
 def build_headers() -> dict:
@@ -71,12 +120,25 @@ http_session: Optional[aiohttp.ClientSession] = None
 
 
 def normalize_autoria_url(raw_url: str) -> str:
+    """
+    Примусово форсує сортування "найновіші спочатку" в БУДЬ-ЯКОМУ вигляді
+    посилання (старий формат ?order=7 і новий ?sort[0].order=...), незалежно
+    від того, яке сортування клієнт мав у своєму посиланні. Старі/конфліктні
+    sort-параметри видаляються, щоб уникнути суперечностей на боці сайту.
+    """
     try:
         parsed = urlparse(raw_url)
-        params = parse_qs(parsed.query)
-        params["order"] = ["7"]
-        params["page"] = ["0"]
-        return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+        # Зберігаємо порядок пар, окрім тих, що стосуються сортування/сторінки —
+        # їх ми повністю перезапишемо самі.
+        pairs = [
+            (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if not re.match(r"^(order|page|sort(\[\d*\])?(\.\w+)?)$", k, re.IGNORECASE)
+        ]
+        pairs.append(("order", "7"))
+        pairs.append(("page", "0"))
+        pairs.append(("sort[0].order", "dates.created.desc"))
+        new_query = urlencode(pairs, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
     except Exception as e:
         logging.error(f"Помилка нормалізації URL: {e}")
         return raw_url
@@ -139,6 +201,9 @@ _MODIFIER_TOKENS = {"id"}
 _IGNORED_TOP_LEVEL = {"order", "page", "sort", "countpage", "size", "lang_id", "lang_ud"}
 
 _TOKEN_RE = re.compile(r'([^\[\].]+)(?:\[(\d*)\])?')
+
+_CURRENCY_MAP = {1: "USD", 2: "UAH", 3: "EUR"}
+_CURRENCY_TO_CODE = {"USD": "1", "UAH": "2", "EUR": "3"}
 
 
 def _deep_unquote(s: str) -> str:
@@ -269,9 +334,8 @@ def parse_autoria_url(url: str) -> dict:
             if field == "price" and field_index is not None:
                 num_val = _to_number(value)
                 if field_index == 0:
-                    curr_map = {1: "USD", 2: "UAH", 3: "EUR"}
-                    if isinstance(num_val, int) and num_val in curr_map:
-                        result["price_currency"] = curr_map[num_val]
+                    if isinstance(num_val, int) and num_val in _CURRENCY_MAP:
+                        result["price_currency"] = _CURRENCY_MAP[num_val]
                     continue
                 elif field_index == 1:
                     result["price_min"] = num_val
@@ -314,18 +378,20 @@ def parse_autoria_url(url: str) -> dict:
 
 def build_autoria_url(parsed: dict) -> str:
     """
-    Будує чистий канонічний URL Auto.ria на основі витягнутих фільтрів.
+    Будує чистий канонічний URL Auto.ria на основі витягнутих фільтрів,
+    завжди з примусовим сортуванням "найновіші спочатку".
     """
     base_url = "https://auto.ria.com/uk/search/"
+    currency_code = _CURRENCY_TO_CODE.get(parsed.get("price_currency"), "1")
     query_params = [
         ("indexName", "auto,order_by,desc"),
         ("categories.main.id", "1"),
         ("country.g.id", "218"),
-        ("price.currency", "1" if parsed.get("price_currency") != "UAH" else "2"),
+        ("price.currency", currency_code),
         ("sort[0].order", "dates.created.desc"),
         ("search_type", "1"),
         ("order", "7"),
-        ("page", "0")
+        ("page", "0"),
     ]
 
     for i, b in enumerate(parsed.get("brand_id", [])):
@@ -404,11 +470,12 @@ def format_filters_summary(parsed: dict) -> str:
 
 
 # ============================================================
-
+#                          БАЗА ДАНИХ
+# ============================================================
 
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_users (
@@ -418,21 +485,27 @@ async def init_db():
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_cars (
-                user_id BIGINT, 
-                car_id TEXT, 
+                user_id BIGINT,
+                car_id TEXT,
                 PRIMARY KEY(user_id, car_id)
             );
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_filters (
-                id SERIAL PRIMARY KEY, 
-                user_id BIGINT, 
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
                 url TEXT,
                 UNIQUE(user_id, url)
             );
         """)
         await conn.execute("""
             ALTER TABLE user_filters ADD COLUMN IF NOT EXISTS filters_json JSONB;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sent_cars_user ON sent_cars(user_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_filters_user ON user_filters(user_id);
         """)
 
 
@@ -446,14 +519,63 @@ async def check_subscription(user_id: int) -> bool:
     return expires > datetime.now()
 
 
-async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
-    try:
-        await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-        return True
-    except Exception as e:
-        logging.error(f"Помилка відправки для {user_id}: {e}")
-        return False
+# ============================================================
+#                    ВІДПРАВКА ПОВІДОМЛЕНЬ
+# ============================================================
 
+def format_car_notification(car: dict) -> str:
+    lines = [
+        "🚗 <b>Нове оголошення!</b>",
+        "",
+        f"📌 <b>{html.escape(car.get('title') or 'Автомобіль')}</b>",
+        f"💰 <b>Ціна:</b> {html.escape(car.get('price') or 'не вказано')}",
+    ]
+    if car.get("link"):
+        lines.append("")
+        lines.append(f'🔗 <a href="{html.escape(car["link"], quote=True)}">Переглянути на Auto.ria</a>')
+    return "\n".join(lines)
+
+
+async def send_car_notification(user_id: int, car: dict) -> bool:
+    """
+    Надсилає сповіщення про нове авто. Якщо вдалось витягти фото — надсилає
+    фото з підписом; якщо фото не вантажиться (невалідний URL, видалене
+    оголошення тощо) — падає назад на звичайне текстове повідомлення,
+    а не втрачає сповіщення взагалі.
+    """
+    caption = format_car_notification(car)
+    image_url = car.get("image")
+
+    for _ in range(3):
+        try:
+            if image_url:
+                await bot.send_photo(user_id, photo=image_url, caption=caption, parse_mode=ParseMode.HTML)
+            else:
+                await bot.send_message(user_id, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+            return True
+        except TelegramRetryAfter as e:
+            logging.warning(f"Флуд-контроль Telegram: чекаємо {e.retry_after}с (user {user_id})")
+            await asyncio.sleep(e.retry_after + 0.5)
+            continue
+        except TelegramForbiddenError:
+            logging.info(f"Користувач {user_id} заблокував бота — пропускаємо.")
+            return False
+        except TelegramBadRequest:
+            # Найімовірніше невалідне фото — пробуємо ще раз текстом.
+            if image_url:
+                image_url = None
+                continue
+            logging.error(f"TelegramBadRequest при відправці для {user_id}")
+            return False
+        except Exception as e:
+            logging.error(f"Помилка відправки для {user_id}: {type(e).__name__}: {e}")
+            return False
+    return False
+
+
+# ============================================================
+#                          ПАРСИНГ
+# ============================================================
 
 def _extract_cars_from_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "html.parser")
@@ -465,17 +587,23 @@ def _extract_cars_from_html(html_text: str) -> list:
     for section in sections:
         try:
             car_id = section.get("data-id") or section.get("data-good-id")
+            title_elem = section.find("a", class_="address") or section.find("a", class_="m-link")
             if not car_id:
-                link_elem = section.find("a", class_="address") or section.find("a", href=True)
-                if link_elem and "auto.ria.com" in link_elem.get("href", ""):
+                link_elem = title_elem or section.find("a", href=True)
+                if link_elem and "auto.ria.com" in (link_elem.get("href") or ""):
                     href = link_elem.get("href")
                     parts = href.split("_")
                     if parts:
                         car_id = ''.join(filter(str.isdigit, parts[-1]))
             if not car_id:
                 continue
-            title_elem = section.find("a", class_="address") or section.find("a", class_="m-link")
-            price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket") or section.find("strong", class_="bold")
+
+            price_elem = (
+                section.find("span", class_="size22")
+                or section.find("span", class_="price-ticket")
+                or section.find("strong", class_="bold")
+                or section.find(class_="price-color")
+            )
 
             title = title_elem.text.strip() if title_elem else "Автомобіль"
             price = price_elem.text.strip() if price_elem else "Ціну не вказано"
@@ -483,7 +611,20 @@ def _extract_cars_from_html(html_text: str) -> list:
             if link and not link.startswith("http"):
                 link = "https://auto.ria.com" + link
 
-            cars.append({"car_id": str(car_id), "title": title, "price": price, "link": link})
+            image = None
+            img_elem = section.find("img")
+            if img_elem:
+                image = img_elem.get("src") or img_elem.get("data-src") or img_elem.get("data-lazy")
+                if image and image.startswith("//"):
+                    image = "https:" + image
+
+            cars.append({
+                "car_id": str(car_id),
+                "title": title,
+                "price": price,
+                "link": link,
+                "image": image,
+            })
         except Exception:
             continue
     return cars
@@ -504,6 +645,15 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
             async with session.get(url, **request_kwargs) as resp:
                 status = resp.status
+
+                if status in (403, 429):
+                    retry_after_header = resp.headers.get("Retry-After")
+                    wait = float(retry_after_header) if retry_after_header and retry_after_header.isdigit() else min(8 * attempt, 40)
+                    logging.warning(f"Auto.ria: статус {status} для {url} (спроба {attempt}/{PARSE_RETRIES}), чекаємо {wait:.0f}с")
+                    last_error = RuntimeError(f"HTTP {status}")
+                    await asyncio.sleep(wait)
+                    continue
+
                 if status != 200:
                     logging.warning(f"Auto.ria відповіла статусом {status} для {url} (спроба {attempt}/{PARSE_RETRIES})")
                     last_error = RuntimeError(f"HTTP {status}")
@@ -511,19 +661,24 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
                     continue
 
                 html_text = await resp.text()
-                cars = _extract_cars_from_html(html_text)
-
-                if not cars and "captcha" in html_text.lower():
-                    logging.warning(f"Схоже на CAPTCHA-сторінку для {url} (спроба {attempt}/{PARSE_RETRIES})")
+                lowered = html_text.lower()
+                if any(marker in lowered for marker in _CHALLENGE_MARKERS):
+                    logging.warning(f"Схоже на CAPTCHA/Cloudflare-сторінку для {url} (спроба {attempt}/{PARSE_RETRIES})")
                     last_error = RuntimeError("Captcha/challenge page")
-                    await asyncio.sleep(min(5 * attempt, 20))
+                    await asyncio.sleep(min(6 * attempt, 30))
                     continue
 
-                return cars
+                return _extract_cars_from_html(html_text)
 
+        except asyncio.TimeoutError as e:
+            last_error = e
+            logging.error(f"Таймаут запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {url}")
+        except aiohttp.ClientError as e:
+            last_error = e
+            logging.error(f"Мережева помилка запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
         except Exception as e:
             last_error = e
-            logging.error(f"Помилка запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
+            logging.error(f"Неочікувана помилка парсингу (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
 
         await asyncio.sleep(1.5 * attempt + random.uniform(0, 1.5))
 
@@ -539,9 +694,13 @@ async def parse_autoria_smart(session: aiohttp.ClientSession, raw_url: str) -> l
     if cars:
         return cars
 
-    logging.info(f"Канонічний URL повернув 0 авто, робимо fallback на оригінальне посилання.")
+    logging.info("Канонічний URL повернув 0 авто, робимо fallback на оригінальне посилання.")
     return await parse_autoria(session, raw_url)
 
+
+# ============================================================
+#                        UI / КЛАВІАТУРИ
+# ============================================================
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
@@ -562,9 +721,25 @@ async def start(msg: types.Message):
         )
     await msg.answer(
         "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
-        "Надішли мені посилання на пошук з Auto.ria, і я сповіщатиму тебе про нові оголошення!",
+        "Надішли мені посилання на пошук з Auto.ria (з телефону чи з компʼютера, "
+        "будь-яке — я сам приведу його до потрібного вигляду), і я сповіщатиму тебе "
+        "про нові оголошення!",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@dp.message(Command("help"))
+async def help_cmd(msg: types.Message):
+    await msg.answer(
+        "ℹ️ <b>Як користуватись:</b>\n\n"
+        "1️⃣ Знайди потрібні авто на auto.ria.com з фільтрами (марка, ціна, рік тощо)\n"
+        "2️⃣ Скопіюй посилання і надішли його сюди\n"
+        "3️⃣ Бот сам почне моніторити нові оголошення за цим фільтром\n\n"
+        f"Можна додати до {MAX_FILTERS_PER_USER} фільтрів одночасно.\n"
+        "Керувати фільтрами: «📁 Мої фільтри».",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard(),
     )
 
 
@@ -628,22 +803,22 @@ async def add_prompt(msg: types.Message):
     await msg.answer("Надішліть посилання з результатами пошуку Auto.ria сюди у чат.")
 
 
-@dp.message(F.text.regexp(r"https?://[^\s]+") | F.caption.regexp(r"https?://[^\s]+"))
-async def add_filter(msg: types.Message):
-    if not await check_subscription(msg.from_user.id):
-        await msg.answer("❌ Необхідна активна підписка!")
-        return
-    text_content = msg.text or msg.caption or ""
-    if "auto.ria.com" not in text_content:
-        await msg.answer("❌ Посилання має бути з сайту auto.ria.com!")
-        return
-
-    raw_url = next((w for w in text_content.split() if w.startswith("http")), "")
-    if not raw_url:
-        return
+async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> None:
+    async with db_pool.acquire() as conn:
+        already_exists = await conn.fetchval(
+            "SELECT 1 FROM user_filters WHERE user_id = $1 AND url = $2",
+            user_id, normalize_autoria_url(raw_url)
+        )
+        if not already_exists:
+            count = await conn.fetchval("SELECT COUNT(*) FROM user_filters WHERE user_id = $1", user_id)
+            if count >= MAX_FILTERS_PER_USER and user_id != ADMIN_ID:
+                await msg.answer(
+                    f"⚠️ Досягнуто ліміт фільтрів ({MAX_FILTERS_PER_USER}). "
+                    f"Видаліть старий фільтр у «📁 Мої фільтри», щоб додати новий."
+                )
+                return
 
     url = normalize_autoria_url(raw_url)
-    user_id = msg.from_user.id
     processing_msg = await msg.answer("⏳ Обробляю посилання...")
 
     parsed_filters = parse_autoria_url(url)
@@ -665,16 +840,88 @@ async def add_filter(msg: types.Message):
         async with db_pool.acquire() as conn:
             await conn.executemany("INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", records)
         await processing_msg.edit_text(
-            f"✅ **Фільтр успішно додано!**\n\n{html.escape(filters_summary)}\n\nЗнайдено {len(current_cars)} авто. Нові оголошення почнуть надходити.",
+            f"✅ <b>Фільтр успішно додано!</b>\n\n{html.escape(filters_summary)}\n\n"
+            f"Знайдено {len(current_cars)} авто. Нові оголошення почнуть надходити.",
             parse_mode=ParseMode.HTML
         )
     else:
         await processing_msg.edit_text(
-            f"⚠️ **Фільтр додано, але зараз не вдалося отримати оголошення з Auto.ria.**\n\n"
+            f"⚠️ <b>Фільтр додано, але зараз не вдалося отримати оголошення з Auto.ria.</b>\n\n"
             f"{html.escape(filters_summary)}\n\n"
             f"Спробуємо ще раз під час наступного циклу моніторингу.",
             parse_mode=ParseMode.HTML
         )
+
+
+@dp.message(F.text.regexp(r"https?://\S+") | F.caption.regexp(r"https?://\S+"))
+async def add_filter(msg: types.Message):
+    if not await check_subscription(msg.from_user.id):
+        await msg.answer("❌ Необхідна активна підписка!")
+        return
+
+    text_content = msg.text or msg.caption or ""
+    raw_urls = re.findall(r"https?://\S+", text_content)
+    autoria_urls = [u for u in raw_urls if "auto.ria.com" in u]
+
+    if not autoria_urls:
+        await msg.answer("❌ Посилання має бути з сайту auto.ria.com!")
+        return
+
+    user_id = msg.from_user.id
+    for raw_url in autoria_urls:
+        try:
+            await _add_single_filter(msg, raw_url, user_id)
+        except Exception as e:
+            logging.error(f"Помилка додавання фільтра для {user_id}: {type(e).__name__}: {e}")
+            await msg.answer("❌ Сталася помилка при додаванні цього посилання. Спробуйте ще раз пізніше.")
+
+
+# ============================================================
+#                     ФОНОВИЙ МОНІТОРИНГ
+# ============================================================
+
+async def _process_filter(sem: asyncio.Semaphore, record) -> None:
+    user_id = record["user_id"]
+    url = record["url"]
+
+    async with sem:
+        try:
+            if not await check_subscription(user_id):
+                return
+
+            cars = await parse_autoria_smart(http_session, url)
+            if not cars:
+                return
+
+            car_ids = [c["car_id"] for c in cars]
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT car_id FROM sent_cars WHERE user_id = $1 AND car_id = ANY($2::text[])",
+                    user_id, car_ids
+                )
+            already_sent = {r["car_id"] for r in rows}
+            new_cars = [c for c in cars if c["car_id"] not in already_sent]
+            if not new_cars:
+                return
+
+            newly_sent_ids = []
+            for car in new_cars:
+                ok = await send_car_notification(user_id, car)
+                if ok:
+                    newly_sent_ids.append(car["car_id"])
+                await asyncio.sleep(0.5)
+
+            if newly_sent_ids:
+                async with db_pool.acquire() as conn:
+                    await conn.executemany(
+                        "INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        [(user_id, cid) for cid in newly_sent_ids]
+                    )
+        except Exception as e:
+            # Падіння одного фільтра НІКОЛИ не повинно зупиняти обробку інших.
+            logging.error(f"Помилка обробки фільтра user={user_id}: {type(e).__name__}: {e}")
+        finally:
+            await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
 
 async def monitor():
@@ -683,34 +930,31 @@ async def monitor():
             async with db_pool.acquire() as conn:
                 filters = await conn.fetch("SELECT user_id, url FROM user_filters")
 
-            for f in filters:
-                user_id = f["user_id"]
-                if not await check_subscription(user_id):
-                    continue
-
-                cars = await parse_autoria_smart(http_session, f["url"])
-                for car in cars:
-                    async with db_pool.acquire() as conn:
-                        already_sent = await conn.fetchval("SELECT 1 FROM sent_cars WHERE user_id = $1 AND car_id = $2", user_id, car["car_id"])
-
-                    if not already_sent:
-                        msg_text = (
-                            f"🚗 <b>Нове оголошення!</b>\n\n"
-                            f"📌 <b>{html.escape(car['title'])}</b>\n"
-                            f"💰 <b>Ціна:</b> {html.escape(car['price'])}\n\n"
-                            f'🔗 <a href="{html.escape(car["link"], quote=True)}">Переглянути на Auto.ria</a>'
-                        )
-                        sent_ok = await safe_send_message(user_id, msg_text)
-                        if sent_ok:
-                            async with db_pool.acquire() as conn:
-                                await conn.execute("INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, car["car_id"])
-                        await asyncio.sleep(0.5)
-
-                await asyncio.sleep(random.uniform(1.5, 3.5))
+            sem = asyncio.Semaphore(PARSE_CONCURRENCY)
+            await asyncio.gather(*[_process_filter(sem, f) for f in filters], return_exceptions=True)
         except Exception as e:
-            logging.error(f"Помилка моніторингу: {type(e).__name__}: {e}")
-        await asyncio.sleep(60)
+            logging.error(f"Критична помилка циклу моніторингу: {type(e).__name__}: {e}")
 
+        await asyncio.sleep(MONITOR_INTERVAL)
+
+
+async def monitor_watchdog():
+    """
+    Якщо monitor() з якоїсь причини все ж завершиться винятком (не мало б,
+    бо всі внутрішні помилки перехоплюються, але про всяк випадок) —
+    перезапускаємо його, щоб фонова перевірка ніколи повністю не зупинялась.
+    """
+    while True:
+        try:
+            await monitor()
+        except Exception as e:
+            logging.error(f"monitor() несподівано завершився: {type(e).__name__}: {e}. Перезапуск через 10с.")
+            await asyncio.sleep(10)
+
+
+# ============================================================
+#                             MAIN
+# ============================================================
 
 async def main():
     global http_session
@@ -727,13 +971,15 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
 
-    asyncio.create_task(monitor())
+    asyncio.create_task(monitor_watchdog())
     logging.info("✅ Бот повністю запущений і працює!")
 
     try:
         await dp.start_polling(bot, handle_signals=True)
     finally:
         await http_session.close()
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":
