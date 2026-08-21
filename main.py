@@ -1,5 +1,5 @@
 """
-Auto.ria Monitor Bot — production-ready refactor with full fixes.
+Auto.ria Monitor Bot — production-ready refactor with HTML parser fixes.
 """
 
 import asyncio
@@ -298,7 +298,6 @@ def parse_autoria_url(url: str) -> dict:
                     bucket.append(item)
                 continue
 
-            # Спеціальна обробка масиву ціни Auto.ria: price[0]=валюта, price[1]=min, price[2]=max
             if field == "price" and field_index is not None:
                 num_val = _to_number(value)
                 if field_index == 0:
@@ -345,10 +344,6 @@ def parse_autoria_url(url: str) -> dict:
 
 
 def build_autoria_url(parsed: dict) -> str:
-    """
-    Будує чистий канонічний URL Auto.ria на основі витягнутих фільтрів,
-    завжди з примусовим сортуванням "найновіші спочатку".
-    """
     base_url = "https://auto.ria.com/uk/search/"
     currency_code = _CURRENCY_TO_CODE.get(parsed.get("price_currency"), "1")
     query_params = [
@@ -541,22 +536,31 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
 
 def _extract_cars_from_html(html_text: str) -> list:
     soup = BeautifulSoup(html_text, "html.parser")
-    sections = soup.find_all("section", class_="ticket-item")
-    if not sections:
-        sections = soup.select('div.ticket-item, div[data-ftid="item"], div.search-result-item')
+    sections = soup.select('section.ticket-item, div.ticket-item, div[data-good-id], div.search-result-item, section.item-ticket')
 
     cars = []
     for section in sections:
         try:
-            car_id = section.get("data-id") or section.get("data-good-id")
-            title_elem = section.find("a", class_="address") or section.find("a", class_="m-link")
-            if not car_id:
-                link_elem = title_elem or section.find("a", href=True)
-                if link_elem and "auto.ria.com" in (link_elem.get("href") or ""):
-                    href = link_elem.get("href")
-                    parts = href.split("_")
-                    if parts:
-                        car_id = ''.join(filter(str.isdigit, parts[-1]))
+            car_id = section.get("data-id") or section.get("data-good-id") or section.get("data-item-id")
+            
+            title_elem = (
+                section.find("a", class_="address") 
+                or section.find("a", class_="m-link") 
+                or section.select_one('a[href*="/auto_"]')
+                or section.find("a", href=True)
+            )
+
+            if not car_id and title_elem:
+                href = title_elem.get("href", "")
+                if "/auto_" in href or "auto.ria.com" in href:
+                    match = re.search(r'_(\d+)\.html', href)
+                    if match:
+                        car_id = match.group(1)
+                    else:
+                        parts = href.split("_")
+                        if parts:
+                            car_id = ''.join(filter(str.isdigit, parts[-1]))
+
             if not car_id:
                 continue
 
@@ -564,11 +568,13 @@ def _extract_cars_from_html(html_text: str) -> list:
                 section.find("span", class_="size22")
                 or section.find("span", class_="price-ticket")
                 or section.find("strong", class_="bold")
-                or section.find(class_="price-color")
+                or section.select_one('.price-color')
+                or section.select_one('[data-currency]')
             )
 
-            title = title_elem.text.strip() if title_elem else "Автомобіль"
-            price = price_elem.text.strip() if price_elem else "Ціну не вказано"
+            title = " ".join((title_elem.text if title_elem else "Автомобіль").split())
+            price = " ".join((price_elem.text if price_elem else "Ціну не вказано").split())
+
             link = title_elem.get("href") if title_elem else ""
             if link and not link.startswith("http"):
                 link = "https://auto.ria.com" + link
