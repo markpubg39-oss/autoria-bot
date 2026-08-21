@@ -50,6 +50,13 @@ MAX_FILTERS_PER_USER = int(os.getenv("MAX_FILTERS_PER_USER", "5"))
 REQUEST_DELAY_MIN = float(os.getenv("REQUEST_DELAY_MIN", "1.5"))
 REQUEST_DELAY_MAX = float(os.getenv("REQUEST_DELAY_MAX", "3.5"))
 
+# Скільки сторінок видачі Auto.ria обходити за одну перевірку фільтра.
+# Захищає від пропуску оголошень, якщо між перевірками з'явилось більше
+# нових авто, ніж влазить на одну сторінку.
+PARSE_MAX_PAGES = int(os.getenv("PARSE_MAX_PAGES", "3"))
+# Якщо сторінка повернула менше оголошень, ніж це число — вважаємо її останньою і зупиняємось.
+PARSE_MIN_PAGE_SIZE = int(os.getenv("PARSE_MIN_PAGE_SIZE", "10"))
+
 # Підписка, яку автоматично отримує новий користувач при першому /start
 NEW_USER_SUBSCRIPTION_DAYS = int(os.getenv("NEW_USER_SUBSCRIPTION_DAYS", "3"))
 
@@ -120,6 +127,22 @@ def normalize_autoria_url(raw_url: str) -> str:
     except Exception as e:
         logging.error(f"Помилка нормалізації URL: {e}")
         return raw_url
+
+
+def _set_page(url: str, page: int) -> str:
+    """Підставляє потрібний номер сторінки в уже нормалізований URL."""
+    try:
+        parsed = urlparse(url)
+        pairs = [
+            (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() != "page"
+        ]
+        pairs.append(("page", str(page)))
+        new_query = urlencode(pairs, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+    except Exception as e:
+        logging.error(f"Помилка підстановки сторінки {page} в URL: {e}")
+        return url
 
 
 # ============================================================
@@ -800,9 +823,43 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
     return []
 
 
-async def parse_autoria_smart(session: aiohttp.ClientSession, raw_url: str) -> list:
+async def parse_autoria_smart(
+    session: aiohttp.ClientSession,
+    raw_url: str,
+    max_pages: int = PARSE_MAX_PAGES,
+) -> list:
+    """
+    Обходить до `max_pages` сторінок видачі (page=0,1,2,...), щоб не втрачати
+    оголошення, коли між перевірками з'являється більше нових авто, ніж
+    влазить на одну сторінку. Дедублікує за car_id. Зупиняється раніше, якщо
+    чергова сторінка порожня або коротша за PARSE_MIN_PAGE_SIZE (ознака
+    останньої сторінки видачі).
+    """
     normalized_url = normalize_autoria_url(raw_url)
-    return await parse_autoria(session, normalized_url)
+
+    all_cars: list = []
+    seen_ids: set = set()
+
+    for page in range(max_pages):
+        page_url = _set_page(normalized_url, page)
+        cars = await parse_autoria(session, page_url)
+
+        if not cars:
+            break
+
+        for car in cars:
+            if car["car_id"] not in seen_ids:
+                seen_ids.add(car["car_id"])
+                all_cars.append(car)
+
+        if len(cars) < PARSE_MIN_PAGE_SIZE:
+            # Це остання сторінка видачі — далі йти немає сенсу
+            break
+
+        if page < max_pages - 1:
+            await asyncio.sleep(random.uniform(0.8, 1.8))
+
+    return all_cars
 
 
 # ============================================================
