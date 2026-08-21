@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -29,24 +30,58 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# Опціональний проксі. Якщо змінна не задана — бот працює напряму (як і раніше).
+# Приклади значень: "http://user:pass@host:port" або "socks5://user:pass@host:port"
+PROXY_URL = os.getenv("PROXY_URL") or None
+
+# Скільки разів повторювати запит до Auto.ria при мережевій помилці
+PARSE_RETRIES = int(os.getenv("PARSE_RETRIES", "3"))
+PARSE_TIMEOUT = int(os.getenv("PARSE_TIMEOUT", "25"))
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Host": "auto.ria.com",
-    "Referer": "https://auto.ria.com/uk/",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0"
-}
+# Пул реалістичних User-Agent для ротації (тільки десктопні Chrome/Firefox/Edge,
+# щоб не виглядати як типовий бот-скрапер з одним застиглим UA)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+]
+
+
+def build_headers() -> dict:
+    """
+    Формуємо заголовки під кожен запит окремо.
+
+    ВАЖЛИВО: раніше в HEADERS вручну задавались "Host" та
+    "Accept-Encoding: gzip, deflate, br". Це, найімовірніше, і було
+    причиною помилки "Помилка запиту до Auto.ria: 0" — aiohttp сам
+    керує Host і Accept-Encoding; якщо сервер відповідає Brotli (br),
+    а в оточенні немає встановленого пакету `Brotli`, aiohttp не може
+    розпакувати тіло відповіді і кидає виняток ще до того, як ви
+    встигаєте прочитати resp.status. Тому тут ми:
+      - НЕ задаємо Host вручну;
+      - дозволяємо тільки gzip/deflate (без br), щоб декодування
+        завжди працювало без додаткових системних залежностей.
+    """
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://auto.ria.com/uk/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+
 
 db_pool: Optional[asyncpg.Pool] = None
 http_session: Optional[aiohttp.ClientSession] = None
@@ -110,46 +145,100 @@ async def safe_send_message(user_id: int, text: str, reply_markup=None) -> bool:
         return False
 
 
+def _extract_cars_from_html(html_text: str) -> list:
+    soup = BeautifulSoup(html_text, "html.parser")
+    sections = soup.find_all("section", class_="ticket-item")
+    if not sections:
+        sections = soup.select('div.ticket-item, div[data-ftid="item"], div.search-result-item')
+
+    cars = []
+    for section in sections:
+        try:
+            car_id = section.get("data-id") or section.get("data-good-id")
+            if not car_id:
+                link_elem = section.find("a", class_="address") or section.find("a", href=True)
+                if link_elem and "auto.ria.com" in link_elem.get("href", ""):
+                    href = link_elem.get("href")
+                    parts = href.split("_")
+                    if parts:
+                        car_id = ''.join(filter(str.isdigit, parts[-1]))
+            if not car_id:
+                continue
+            title_elem = section.find("a", class_="address") or section.find("a", class_="m-link")
+            price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket") or section.find("strong", class_="bold")
+
+            title = title_elem.text.strip() if title_elem else "Автомобіль"
+            price = price_elem.text.strip() if price_elem else "Ціну не вказано"
+            link = title_elem.get("href") if title_elem else ""
+            if link and not link.startswith("http"):
+                link = "https://auto.ria.com" + link
+
+            cars.append({"car_id": str(car_id), "title": title, "price": price, "link": link})
+        except Exception:
+            continue
+    return cars
+
+
 async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
-    try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True) as resp:
-            html_text = await resp.text()
-            if resp.status != 200:
-                return []
-            soup = BeautifulSoup(html_text, "html.parser")
-            sections = soup.find_all("section", class_="ticket-item")
-            if not sections:
-                sections = soup.select('div.ticket-item, div[data-ftid="item"], div.search-result-item')
+    """
+    Запит до Auto.ria з ретраями, ротацією User-Agent та детальним
+    логуванням реальної причини збою (тип винятку + повідомлення),
+    замість непрозорого "Помилка запиту до Auto.ria: 0".
+    """
+    last_error: Optional[Exception] = None
 
-            cars = []
-            for section in sections:
-                try:
-                    car_id = section.get("data-id") or section.get("data-good-id")
-                    if not car_id:
-                        link_elem = section.find("a", class_="address") or section.find("a", href=True)
-                        if link_elem and "auto.ria.com" in link_elem.get("href", ""):
-                            href = link_elem.get("href")
-                            parts = href.split("_")
-                            if parts:
-                                car_id = ''.join(filter(str.isdigit, parts[-1]))
-                    if not car_id:
-                        continue
-                    title_elem = section.find("a", class_="address") or section.find("a", class_="m-link")
-                    price_elem = section.find("span", class_="size22") or section.find("span", class_="price-ticket") or section.find("strong", class_="bold")
+    for attempt in range(1, PARSE_RETRIES + 1):
+        try:
+            request_kwargs = dict(
+                headers=build_headers(),
+                timeout=aiohttp.ClientTimeout(total=PARSE_TIMEOUT),
+                allow_redirects=True,
+            )
+            if PROXY_URL:
+                request_kwargs["proxy"] = PROXY_URL
 
-                    title = title_elem.text.strip() if title_elem else "Автомобіль"
-                    price = price_elem.text.strip() if price_elem else "Ціну не вказано"
-                    link = title_elem.get("href") if title_elem else ""
-                    if link and not link.startswith("http"):
-                        link = "https://auto.ria.com" + link
-
-                    cars.append({"car_id": str(car_id), "title": title, "price": price, "link": link})
-                except Exception:
+            async with session.get(url, **request_kwargs) as resp:
+                # Читаємо статус ДО читання тіла — якщо сайт віддає
+                # 403/429, ми одразу побачимо це в логах, а не отримаємо
+                # незрозумілий виняток нижче.
+                status = resp.status
+                if status != 200:
+                    logging.warning(f"Auto.ria відповіла статусом {status} для {url} (спроба {attempt}/{PARSE_RETRIES})")
+                    last_error = RuntimeError(f"HTTP {status}")
+                    # 403/429/503 часто означають бан IP чи rate-limit —
+                    # має сенс почекати довше перед наступною спробою
+                    await asyncio.sleep(min(5 * attempt, 20))
                     continue
-            return cars
-    except Exception as e:
-        logging.error(f"Помилка запиту до Auto.ria: {e}")
-        return []
+
+                html_text = await resp.text()
+                cars = _extract_cars_from_html(html_text)
+
+                if not cars and "captcha" in html_text.lower():
+                    logging.warning(f"Схоже на CAPTCHA-сторінку для {url} (спроба {attempt}/{PARSE_RETRIES})")
+                    last_error = RuntimeError("Captcha/challenge page")
+                    await asyncio.sleep(min(5 * attempt, 20))
+                    continue
+
+                return cars
+
+        except asyncio.TimeoutError as e:
+            last_error = e
+            logging.error(f"Тайм-аут запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {e}")
+        except aiohttp.ClientConnectorError as e:
+            last_error = e
+            logging.error(f"Помилка з'єднання з Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
+        except aiohttp.ClientError as e:
+            last_error = e
+            logging.error(f"aiohttp.ClientError під час запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
+        except Exception as e:
+            last_error = e
+            logging.error(f"Неочікувана помилка запиту до Auto.ria (спроба {attempt}/{PARSE_RETRIES}): {type(e).__name__}: {e}")
+
+        # Невелика пауза з джиттером перед повторною спробою
+        await asyncio.sleep(1.5 * attempt + random.uniform(0, 1.5))
+
+    logging.error(f"Усі {PARSE_RETRIES} спроби запиту до {url} провалились. Остання помилка: {type(last_error).__name__ if last_error else '—'}: {last_error}")
+    return []
 
 
 def get_main_keyboard():
@@ -255,8 +344,13 @@ async def add_filter(msg: types.Message):
         records = [(user_id, c["car_id"]) for c in current_cars]
         async with db_pool.acquire() as conn:
             await conn.executemany("INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", records)
-
-    await processing_msg.edit_text("✅ **Фільтр успішно додано!** Нові оголошення почнуть надходити.", parse_mode=ParseMode.HTML)
+        await processing_msg.edit_text("✅ **Фільтр успішно додано!** Нові оголошення почнуть надходити.", parse_mode=ParseMode.HTML)
+    else:
+        await processing_msg.edit_text(
+            "⚠️ **Фільтр додано, але зараз не вдалося отримати оголошення з Auto.ria.**\n"
+            "Спробуємо ще раз під час наступного циклу моніторингу.",
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def monitor():
@@ -287,8 +381,12 @@ async def monitor():
                             async with db_pool.acquire() as conn:
                                 await conn.execute("INSERT INTO sent_cars (user_id, car_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", user_id, car["car_id"])
                         await asyncio.sleep(0.5)
+
+                # Пауза між різними фільтрами, щоб не бити по Auto.ria
+                # надто часто послідовними запитами з одного IP
+                await asyncio.sleep(random.uniform(1.5, 3.5))
         except Exception as e:
-            logging.error(f"Помилка моніторингу: {e}")
+            logging.error(f"Помилка моніторингу: {type(e).__name__}: {e}")
         await asyncio.sleep(60)
 
 
@@ -296,7 +394,17 @@ async def main():
     global http_session
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     await init_db()
-    http_session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+
+    # Обмежуємо кількість одночасних з'єднань, щоб не створювати
+    # підозрілий сплеск паралельних запитів з одного IP і не тримати
+    # зайвих відкритих сокетів (проти витоку пам'яті/дескрипторів)
+    connector = aiohttp.TCPConnector(limit=10, limit_per_host=4, ttl_dns_cache=300)
+    http_session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(), connector=connector)
+
+    if PROXY_URL:
+        logging.info("🌐 Проксі увімкнено для запитів до Auto.ria.")
+    else:
+        logging.info("🌐 Проксі не задано (PROXY_URL порожній) — запити йдуть напряму з IP Render.")
 
     # === РЯТІВНА ЗАТРИМКА ===
     # Даємо 15 секунд старому процесу вмерти перед запуском нового
