@@ -1,5 +1,5 @@
 """
-Auto.ria Monitor Bot — Production Ready (Resilient Multi-Strategy Parser)
+Auto.ria Monitor Bot — Production Ready (Clean Notification Edition)
 """
 
 import asyncio
@@ -430,10 +430,10 @@ async def check_subscription(user_id: int) -> bool:
 # ============================================================
 
 def format_car_notification(car: dict) -> str:
-   lines = [
+    lines = [
         "🚗 <b>Знайдено нове оголошення!</b>",
     ]
-if car.get("link"):
+    if car.get("link"):
         lines.append(f'🔗 <a href="{html.escape(car["link"], quote=True)}">Переглянути на Auto.ria</a>')
     return "\n".join(lines)
 
@@ -502,7 +502,7 @@ def _normalize_image(src: Optional[str]) -> Optional[str]:
 
 
 def _extract_via_dom(soup: BeautifulSoup) -> list:
-    """Стратегія 1: DOM парсинг з розширеними селекторами ціни та заголовків."""
+    """Стратегія 1: DOM парсинг картки оголошень."""
     sections = soup.select(
         'section.ticket-item, div.ticket-item, section.item-ticket, '
         'div[data-good-id], div.search-result-item, '
