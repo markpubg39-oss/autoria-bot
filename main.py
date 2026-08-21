@@ -1195,7 +1195,24 @@ async def _process_filter(sem: asyncio.Semaphore, record) -> None:
             await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
 
 
+MONITOR_ERROR_COOLDOWN = int(os.getenv("MONITOR_ERROR_COOLDOWN", "120"))
+
+
 async def monitor():
+    """
+    Головний фоновий цикл моніторингу.
+
+    Розрахований на роки безперервної роботи без ручних рестартів: жодна
+    помилка — 403/429 від Auto.ria, таймаут, обрив мережі, збій БД чи будь-
+    який інший неочікуваний виняток — не повинна зупинити цикл назавжди
+    або покласти бота.
+
+    Помилки окремого фільтра (один конкретний URL) вже гасяться всередині
+    _process_filter(). Тут — друга лінія оборони: якщо впаде щось на рівні
+    всього циклу (наприклад, недоступна БД під час SELECT filters, чи будь-
+    який виняток, що якимось чином просочився крізь return_exceptions=True
+    у asyncio.gather), ловимо його тут, логуємо і НЕ даємо циклу померти.
+    """
     while True:
         try:
             async with db_pool.acquire() as conn:
@@ -1203,8 +1220,13 @@ async def monitor():
 
             sem = asyncio.Semaphore(PARSE_CONCURRENCY)
             await asyncio.gather(*[_process_filter(sem, f) for f in filters], return_exceptions=True)
+
         except Exception as e:
-            logging.error(f"Критична помилка циклу моніторингу: {type(e).__name__}: {e}")
+            logging.error(f"Помилка в циклі моніторингу: {e}")
+            # Даємо сайту "віддихатись" довшою паузою, ніж звичайний інтервал,
+            # і одразу йдемо на наступну ітерацію — цикл ніколи не завершується.
+            await asyncio.sleep(MONITOR_ERROR_COOLDOWN)
+            continue
 
         await asyncio.sleep(MONITOR_INTERVAL)
 
