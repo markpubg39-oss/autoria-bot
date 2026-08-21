@@ -265,6 +265,21 @@ def parse_autoria_url(url: str) -> dict:
                     bucket.append(item)
                 continue
 
+            # Спеціальна обробка масиву ціни Auto.ria: price[0]=валюта, price[1]=min, price[2]=max
+            if field == "price" and field_index is not None:
+                num_val = _to_number(value)
+                if field_index == 0:
+                    curr_map = {1: "USD", 2: "UAH", 3: "EUR"}
+                    if isinstance(num_val, int) and num_val in curr_map:
+                        result["price_currency"] = curr_map[num_val]
+                    continue
+                elif field_index == 1:
+                    result["price_min"] = num_val
+                    continue
+                elif field_index == 2:
+                    result["price_max"] = num_val
+                    continue
+
             if bound is None:
                 for name, _ in tokens:
                     lname = name.lower()
@@ -517,11 +532,6 @@ async def parse_autoria(session: aiohttp.ClientSession, url: str) -> list:
 
 
 async def parse_autoria_smart(session: aiohttp.ClientSession, raw_url: str) -> list:
-    """
-    1. Перебудовує посилання в канонічне.
-    2. Якщо знаходить авто — повертає їх.
-    3. Якщо канонічний URL повернув 0 авто — робить fallback на оригінальний raw_url.
-    """
     parsed_filters = parse_autoria_url(raw_url)
     canonical_url = build_autoria_url(parsed_filters)
 
