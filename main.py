@@ -1,5 +1,5 @@
 """
-Auto.ria Monitor Bot — Production Ready (Clean Notification Edition)
+Auto.ria Monitor Bot — Production Ready + Full Admin Control
 """
 
 import asyncio
@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # ============================================================
@@ -49,6 +49,9 @@ PARSE_CONCURRENCY = int(os.getenv("PARSE_CONCURRENCY", "3"))
 MAX_FILTERS_PER_USER = int(os.getenv("MAX_FILTERS_PER_USER", "5"))
 REQUEST_DELAY_MIN = float(os.getenv("REQUEST_DELAY_MIN", "1.5"))
 REQUEST_DELAY_MAX = float(os.getenv("REQUEST_DELAY_MAX", "3.5"))
+
+# Підписка, яку автоматично отримує новий користувач при першому /start
+NEW_USER_SUBSCRIPTION_DAYS = int(os.getenv("NEW_USER_SUBSCRIPTION_DAYS", "3"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -386,8 +389,13 @@ async def init_db():
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_users (
                 user_id BIGINT PRIMARY KEY,
+                username TEXT,
                 subscription_expires TIMESTAMP
             );
+        """)
+        # На випадок, якщо таблиця вже існувала зі старої версії бота без колонки username
+        await conn.execute("""
+            ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS username TEXT;
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_cars (
@@ -796,18 +804,48 @@ def get_main_keyboard():
     )
 
 
+# ============================================================
+#                     START (реєстрація юзера)
+# ============================================================
+
 @dp.message(Command("start"))
 async def start(msg: types.Message):
+    user_id = msg.from_user.id
+    username = msg.from_user.username or "без_юзернейму"
+
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-            msg.from_user.id, datetime.now() + timedelta(days=1)
-        )
+        exists = await conn.fetchval("SELECT 1 FROM bot_users WHERE user_id = $1", user_id)
+        if not exists:
+            await conn.execute(
+                """
+                INSERT INTO bot_users (user_id, username, subscription_expires)
+                VALUES ($1, $2, NOW() + make_interval(days => $3))
+                """,
+                user_id, username, NEW_USER_SUBSCRIPTION_DAYS
+            )
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🆕 <b>Новий користувач!</b>\n"
+                    f"ID: <code>{user_id}</code>\n"
+                    f"Username: @{html.escape(username)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logging.warning(f"Не вдалося сповістити адміна про нового користувача: {e}")
+        else:
+            # Оновлюємо username на випадок, якщо юзер його змінив
+            await conn.execute(
+                "UPDATE bot_users SET username = $2 WHERE user_id = $1",
+                user_id, username
+            )
+
     await msg.answer(
         "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
         "Надішли мені посилання на пошук з Auto.ria (з телефону чи з компʼютера, "
         "будь-яке — я сам приведу його до потрібного вигляду), і я сповіщатиму тебе "
-        "про нові оголошення!",
+        f"про нові оголошення!\n\n"
+        f"🎁 Тобі активовано безкоштовну підписку на {NEW_USER_SUBSCRIPTION_DAYS} дні.",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -966,6 +1004,98 @@ async def add_filter(msg: types.Message):
         except Exception as e:
             logging.error(f"Помилка додавання фільтра для {user_id}: {type(e).__name__}: {e}")
             await msg.answer("❌ Сталася помилка при додаванні цього посилання. Спробуйте ще раз пізніше.")
+
+
+# ============================================================
+#                    АДМІН-КОМАНДИ
+# ============================================================
+
+@dp.message(Command("users"))
+async def list_users(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            "SELECT user_id, username, subscription_expires FROM bot_users ORDER BY subscription_expires DESC NULLS LAST"
+        )
+    if not users:
+        await msg.answer("Користувачів поки немає.")
+        return
+
+    lines = ["👥 <b>Список користувачів:</b>\n"]
+    for u in users:
+        uname = html.escape(u["username"] or "без_юзернейму")
+        expires = u["subscription_expires"]
+        expires_str = expires.strftime("%Y-%m-%d %H:%M") if expires else "—"
+        active = "✅" if (expires and expires > datetime.now()) else "❌"
+        lines.append(f"{active} ID: <code>{u['user_id']}</code> | @{uname} | до {expires_str}")
+
+    text = "\n".join(lines)
+    # Telegram обмежує повідомлення ~4096 символів — ріжемо на частини за потреби
+    for i in range(0, len(text), 4000):
+        await msg.answer(text[i:i + 4000], parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("give"))
+async def give_sub(msg: types.Message, command: CommandObject):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    if not command.args:
+        await msg.answer("Використання: /give <user_id> [днів] (за замовчуванням 30)")
+        return
+
+    args = command.args.split()
+    try:
+        target_id = int(args[0])
+        days = int(args[1]) if len(args) > 1 else 30
+    except (ValueError, IndexError):
+        await msg.answer("❌ Невірний формат. Використання: /give <user_id> [днів]")
+        return
+
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM bot_users WHERE user_id = $1", target_id)
+        if not exists:
+            await conn.execute(
+                "INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, NOW())",
+                target_id
+            )
+        await conn.execute(
+            """
+            UPDATE bot_users
+            SET subscription_expires = GREATEST(COALESCE(subscription_expires, NOW()), NOW())
+                                        + make_interval(days => $2)
+            WHERE user_id = $1
+            """,
+            target_id, days
+        )
+
+    await msg.answer(f"✅ Користувачу {target_id} додано {days} днів підписки.")
+    try:
+        await bot.send_message(target_id, f"🎉 Вам додано {days} днів підписки адміністратором!")
+    except Exception:
+        pass
+
+
+@dp.message(Command("ban"))
+async def ban_user(msg: types.Message, command: CommandObject):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    if not command.args:
+        await msg.answer("Використання: /ban <user_id>")
+        return
+
+    try:
+        target_id = int(command.args.split()[0])
+    except (ValueError, IndexError):
+        await msg.answer("❌ Невірний формат. Використання: /ban <user_id>")
+        return
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM bot_users WHERE user_id = $1", target_id)
+        await conn.execute("DELETE FROM user_filters WHERE user_id = $1", target_id)
+        await conn.execute("DELETE FROM sent_cars WHERE user_id = $1", target_id)
+
+    await msg.answer(f"🚫 Користувача {target_id} видалено разом з усіма його фільтрами.")
 
 
 # ============================================================
