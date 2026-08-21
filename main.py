@@ -1,29 +1,5 @@
 """
-Auto.ria Monitor Bot — production-ready refactor.
-
-ЗМІНИ У ЦЬОМУ РЕФАКТОРИНГУ (порівняно з початковою версією):
-  1. normalize_autoria_url() тепер ЖОРСТКО й надійно форсує сортування
-     "найновіші спочатку" (обидва варіанти параметра: старий order=7
-     і новий sort[0].order=dates.created.desc), незалежно від того,
-     що клієнт мав у посиланні, і видаляє конфліктні старі sort-параметри.
-  2. parse_autoria(): краще розрізнення 403/429 (з повагою до Retry-After),
-     ширший список маркерів Cloudflare/капчі, перевірка на challenge-сторінку
-     виконується ДО спроби витягти авто (а не лише коли cars порожній).
-  3. monitor(): кожен фільтр обробляється в try/except окремо — падіння
-     одного фільтра/користувача більше НЕ ламає весь цикл моніторингу.
-     Додано обмежену паралельність (Semaphore) та пакетну перевірку/запис
-     sent_cars (замість запиту в БД на кожен окремий автомобіль).
-  4. Обробка Telegram-специфічних помилок: TelegramRetryAfter (флуд-контроль)
-     коректно очікується; TelegramForbiddenError (юзер заблокував бота)
-     не спамить в лог і не валить цикл.
-  5. Якщо фоновий таск monitor() все ж впаде — він автоматично
-     перезапускається (watchdog), а не мовчки помирає.
-  6. Ліміт кількості фільтрів на користувача (MAX_FILTERS_PER_USER) —
-     захист від зловживань на безкоштовному/платному тарифі.
-  7. Підтримка кількох посилань в одному повідомленні.
-  8. Гарніші сповіщення (з фото оголошення, якщо вдалось витягти) з
-     fallback на текстове повідомлення, якщо фото не завантажилось.
-  9. Дрібні фікси: EUR у build_autoria_url, індекси в БД, чистіші логи.
+Auto.ria Monitor Bot — production-ready refactor with full fixes.
 """
 
 import asyncio
@@ -120,16 +96,8 @@ http_session: Optional[aiohttp.ClientSession] = None
 
 
 def normalize_autoria_url(raw_url: str) -> str:
-    """
-    Примусово форсує сортування "найновіші спочатку" в БУДЬ-ЯКОМУ вигляді
-    посилання (старий формат ?order=7 і новий ?sort[0].order=...), незалежно
-    від того, яке сортування клієнт мав у своєму посиланні. Старі/конфліктні
-    sort-параметри видаляються, щоб уникнути суперечностей на боці сайту.
-    """
     try:
         parsed = urlparse(raw_url)
-        # Зберігаємо порядок пар, окрім тих, що стосуються сортування/сторінки —
-        # їх ми повністю перезапишемо самі.
         pairs = [
             (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
             if not re.match(r"^(order|page|sort(\[\d*\])?(\.\w+)?)$", k, re.IGNORECASE)
@@ -388,6 +356,7 @@ def build_autoria_url(parsed: dict) -> str:
         ("categories.main.id", "1"),
         ("country.g.id", "218"),
         ("price.currency", currency_code),
+        ("price[0]", currency_code),
         ("sort[0].order", "dates.created.desc"),
         ("search_type", "1"),
         ("order", "7"),
@@ -409,10 +378,10 @@ def build_autoria_url(parsed: dict) -> str:
 
     if parsed.get("price_min") is not None:
         query_params.append(("price_ot", str(parsed["price_min"])))
-        query_params.append(("price[0]", str(parsed["price_min"])))
+        query_params.append(("price[1]", str(parsed["price_min"])))
     if parsed.get("price_max") is not None:
         query_params.append(("price_do", str(parsed["price_max"])))
-        query_params.append(("price[1]", str(parsed["price_max"])))
+        query_params.append(("price[2]", str(parsed["price_max"])))
 
     if parsed.get("mileage_min") is not None:
         query_params.append(("raceFrom", str(parsed["mileage_min"])))
@@ -470,7 +439,7 @@ def format_filters_summary(parsed: dict) -> str:
 
 
 # ============================================================
-#                          БАЗА ДАНИХ
+#                           БАЗА ДАНИХ
 # ============================================================
 
 async def init_db():
@@ -537,12 +506,6 @@ def format_car_notification(car: dict) -> str:
 
 
 async def send_car_notification(user_id: int, car: dict) -> bool:
-    """
-    Надсилає сповіщення про нове авто. Якщо вдалось витягти фото — надсилає
-    фото з підписом; якщо фото не вантажиться (невалідний URL, видалене
-    оголошення тощо) — падає назад на звичайне текстове повідомлення,
-    а не втрачає сповіщення взагалі.
-    """
     caption = format_car_notification(car)
     image_url = car.get("image")
 
@@ -561,7 +524,6 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
             logging.info(f"Користувач {user_id} заблокував бота — пропускаємо.")
             return False
         except TelegramBadRequest:
-            # Найімовірніше невалідне фото — пробуємо ще раз текстом.
             if image_url:
                 image_url = None
                 continue
@@ -574,7 +536,7 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
 
 
 # ============================================================
-#                          ПАРСИНГ
+#                           ПАРСИНГ
 # ============================================================
 
 def _extract_cars_from_html(html_text: str) -> list:
@@ -918,7 +880,6 @@ async def _process_filter(sem: asyncio.Semaphore, record) -> None:
                         [(user_id, cid) for cid in newly_sent_ids]
                     )
         except Exception as e:
-            # Падіння одного фільтра НІКОЛИ не повинно зупиняти обробку інших.
             logging.error(f"Помилка обробки фільтра user={user_id}: {type(e).__name__}: {e}")
         finally:
             await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
@@ -939,11 +900,6 @@ async def monitor():
 
 
 async def monitor_watchdog():
-    """
-    Якщо monitor() з якоїсь причини все ж завершиться винятком (не мало б,
-    бо всі внутрішні помилки перехоплюються, але про всяк випадок) —
-    перезапускаємо його, щоб фонова перевірка ніколи повністю не зупинялась.
-    """
     while True:
         try:
             await monitor()
