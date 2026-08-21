@@ -1257,3 +1257,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+@dp.message(F.video)
+async def get_video_id(msg: types.Message):
+    await msg.answer(f"Твій file_id:\n<code>{msg.video.file_id}</code>", parse_mode=ParseMode.HTML)
