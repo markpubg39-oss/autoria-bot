@@ -433,7 +433,7 @@ def format_car_notification(car: dict) -> str:
    lines = [
         "🚗 <b>Знайдено нове оголошення!</b>",
     ]
-    if car.get("link"):
+if car.get("link"):
         lines.append(f'🔗 <a href="{html.escape(car["link"], quote=True)}">Переглянути на Auto.ria</a>')
     return "\n".join(lines)
 
