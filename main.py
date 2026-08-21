@@ -480,6 +480,8 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
 #                           ПАРСИНГ HTML
 # ============================================================
 
+URL_RE = re.compile(r"https?://\S+")
+
 _ID_FROM_HREF_RE = re.compile(r'/auto_[^"/?]*?_(\d{6,})\.html', re.IGNORECASE)
 _ID_ANY_RE = re.compile(r'(\d{6,})\.html')
 
@@ -1015,14 +1017,34 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
         )
 
 
-@dp.message(F.text.regexp(r"https?://\S+") | F.caption.regexp(r"https?://\S+"))
+def _message_has_url(message: types.Message) -> bool:
+    """
+    Безпечна перевірка наявності посилання в тексті АБО підписі повідомлення.
+
+    Навмисно НЕ використовується `F.text.regexp(...) | F.caption.regexp(...)`:
+    оператор `|` у magic_filter (aiogram) НЕ виконує лінивого short-circuit —
+    обидві гілки обчислюються завжди, через `operator.or_`. Для звичайного
+    текстового повідомлення `message.caption` дорівнює None, і виклик
+    `regexp().search(None)` кидає `TypeError: expected string or bytes-like
+    object`. Цей виняток вилітає ще на етапі перевірки фільтра (до хендлера),
+    і оскільки в диспетчері не було `@dp.errors()`, aiogram мовчки "з'їдав"
+    update — бот ігнорував абсолютно будь-яке повідомлення з посиланням.
+
+    Тут звичайна python-функція: жодних regexp-операцій над None, ніяких
+    прихованих крашів. aiogram 3 підтримує plain callable як фільтр напряму.
+    """
+    text_content = message.text or message.caption or ""
+    return bool(URL_RE.search(text_content))
+
+
+@dp.message(_message_has_url)
 async def add_filter(msg: types.Message):
     if not await check_subscription(msg.from_user.id):
         await msg.answer("❌ Необхідна активна підписка!")
         return
 
     text_content = msg.text or msg.caption or ""
-    raw_urls = re.findall(r"https?://\S+", text_content)
+    raw_urls = URL_RE.findall(text_content)
     autoria_urls = [u for u in raw_urls if "auto.ria.com" in u]
 
     if not autoria_urls:
@@ -1194,6 +1216,39 @@ async def monitor_watchdog():
         except Exception as e:
             logging.error(f"monitor() несподівано завершився: {type(e).__name__}: {e}. Перезапуск через 10с.")
             await asyncio.sleep(10)
+
+
+# ============================================================
+#                    ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК
+# ============================================================
+# Раніше в диспетчері не було жодного @dp.errors() — будь-який неочікуваний
+# виняток під час перевірки фільтрів чи виконання хендлера мовчки "з'їдався"
+# aiogram-ом: update вважався обробленим, юзер не отримував жодної відповіді,
+# а в логах не залишалось нічого зрозумілого. Саме так довго ховалась
+# проблема з F.text.regexp(...) | F.caption.regexp(...) на None. Тепер
+# будь-яка подібна помилка гарантовано потрапляє в лог і, за можливості,
+# адміну — а не зникає безслідно.
+
+@dp.errors()
+async def global_error_handler(event: types.ErrorEvent) -> bool:
+    update = event.update
+    exc = event.exception
+    logging.error(
+        f"Необроблений виняток під час обробки update_id={getattr(update, 'update_id', '?')}: "
+        f"{type(exc).__name__}: {exc}",
+        exc_info=exc,
+    )
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"⚠️ <b>Неочікувана помилка в боті</b>\n"
+            f"<code>{html.escape(type(exc).__name__)}: {html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass  # якщо навіть сповіщення адміну не вдалось відправити — просто ігноруємо
+
+    return True  # позначаємо помилку як оброблену, щоб вона не спливала далі
 
 
 # ============================================================
