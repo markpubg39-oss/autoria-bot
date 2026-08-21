@@ -20,7 +20,13 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    FSInputFile,
+)
 
 # ============================================================
 #                     НАЛАШТУВАННЯ
@@ -52,6 +58,9 @@ REQUEST_DELAY_MAX = float(os.getenv("REQUEST_DELAY_MAX", "3.5"))
 
 # Підписка, яку автоматично отримує новий користувач при першому /start
 NEW_USER_SUBSCRIPTION_DAYS = int(os.getenv("NEW_USER_SUBSCRIPTION_DAYS", "3"))
+
+# Шлях до відеоінструкції, яка надсилається разом з /start
+START_VIDEO_PATH = os.getenv("START_VIDEO_PATH", "instructions.mp4")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -817,9 +826,10 @@ def get_main_keyboard():
 
 
 # ============================================================
-#              START (реєстрація юзера + атомарність)
+#              START (реєстрація юзера + атомарність + відео)
 # ============================================================
-# ТУТ ДОДАНО: Атомарний INSERT без конфліктів і винесене сповіщення адміну!
+# ТУТ ДОДАНО: Атомарний INSERT без конфліктів, винесене сповіщення адміну
+# та єдине повідомлення з відеоінструкцією (caption + FSInputFile).
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -855,15 +865,28 @@ async def start(msg: types.Message):
         except Exception as e:
             logging.warning(f"Не вдалося сповістити адміна про нового користувача: {e}")
 
-    await msg.answer(
-        "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
+    caption = (
+        "👋 <b>Вітаю! Я бот для швидкого моніторингу Auto.ria.</b>\n\n"
         "Надішли мені посилання на пошук з Auto.ria (з телефону чи з компʼютера, "
         "будь-яке — я сам приведу його до потрібного вигляду), і я сповіщатиму тебе "
-        f"про нові оголошення!\n\n"
-        f"🎁 Тобі активовано безкоштовну підписку на {NEW_USER_SUBSCRIPTION_DAYS} дні.",
-        reply_markup=get_main_keyboard(),
-        parse_mode=ParseMode.MARKDOWN
+        "про нові оголошення!\n\n"
+        f"🎁 Тобі активовано безкоштовну підписку на {NEW_USER_SUBSCRIPTION_DAYS} дні."
     )
+
+    try:
+        video = FSInputFile(START_VIDEO_PATH)
+        await bot.send_video(
+            chat_id=msg.chat.id,
+            video=video,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            supports_streaming=True,
+            reply_markup=get_main_keyboard(),
+        )
+    except Exception as e:
+        logging.error(f"Не вдалося надіслати відеоінструкцію ({START_VIDEO_PATH}): {type(e).__name__}: {e}")
+        # Фолбек: якщо файл відео не знайдено/недоступний — надсилаємо хоча б текст
+        await msg.answer(caption, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @dp.message(Command("help"))
@@ -1257,6 +1280,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+
 @dp.message(F.video)
 async def get_video_id(msg: types.Message):
     await msg.answer(f"Твій file_id:\n<code>{msg.video.file_id}</code>", parse_mode=ParseMode.HTML)
