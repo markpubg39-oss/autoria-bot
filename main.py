@@ -23,7 +23,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 # ============================================================
-#                       НАЛАШТУВАННЯ
+#                     НАЛАШТУВАННЯ
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -379,48 +379,58 @@ def format_filters_summary(parsed: dict) -> str:
 
 
 # ============================================================
-#                           БАЗА ДАНИХ
+#                            БАЗА ДАНИХ
 # ============================================================
+# ТУТ ДОДАНО: Спроби підключення (retries) та обгортання DDL у транзакцію!
 
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    for attempt in range(1, 6):
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, timeout=15)
+            break
+        except Exception as e:
+            if attempt == 5:
+                raise
+            logging.warning(f"Спроба {attempt}/5 підключення до БД не вдалась: {e}. Повтор через 3с...")
+            await asyncio.sleep(3)
+
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                subscription_expires TIMESTAMP
-            );
-        """)
-        # На випадок, якщо таблиця вже існувала зі старої версії бота без колонки username
-        await conn.execute("""
-            ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS username TEXT;
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS sent_cars (
-                user_id BIGINT,
-                car_id TEXT,
-                PRIMARY KEY(user_id, car_id)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_filters (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                url TEXT,
-                UNIQUE(user_id, url)
-            );
-        """)
-        await conn.execute("""
-            ALTER TABLE user_filters ADD COLUMN IF NOT EXISTS filters_json JSONB;
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_sent_cars_user ON sent_cars(user_id);
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_filters_user ON user_filters(user_id);
-        """)
+        async with conn.transaction():
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    subscription_expires TIMESTAMP
+                );
+            """)
+            await conn.execute("""
+                ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS username TEXT;
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sent_cars (
+                    user_id BIGINT,
+                    car_id TEXT,
+                    PRIMARY KEY(user_id, car_id)
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_filters (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    url TEXT,
+                    UNIQUE(user_id, url)
+                );
+            """)
+            await conn.execute("""
+                ALTER TABLE user_filters ADD COLUMN IF NOT EXISTS filters_json JSONB;
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sent_cars_user ON sent_cars(user_id);
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_filters_user ON user_filters(user_id);
+            """)
 
 
 async def check_subscription(user_id: int) -> bool:
@@ -477,7 +487,7 @@ async def send_car_notification(user_id: int, car: dict) -> bool:
 
 
 # ============================================================
-#                           ПАРСИНГ HTML
+#                            ПАРСИНГ HTML
 # ============================================================
 
 URL_RE = re.compile(r"https?://\S+")
@@ -807,40 +817,43 @@ def get_main_keyboard():
 
 
 # ============================================================
-#                     START (реєстрація юзера)
+#              START (реєстрація юзера + атомарність)
 # ============================================================
+# ТУТ ДОДАНО: Атомарний INSERT без конфліктів і винесене сповіщення адміну!
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
     username = msg.from_user.username or "без_юзернейму"
 
+    is_new = False
     async with db_pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM bot_users WHERE user_id = $1", user_id)
-        if not exists:
-            await conn.execute(
-                """
-                INSERT INTO bot_users (user_id, username, subscription_expires)
-                VALUES ($1, $2, NOW() + make_interval(days => $3))
-                """,
-                user_id, username, NEW_USER_SUBSCRIPTION_DAYS
+        # Атомарна перевірка та вставка без ризику Race Condition (UniqueViolation)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO bot_users (user_id, username, subscription_expires)
+            VALUES ($1, $2, NOW() + make_interval(days => $3))
+            ON CONFLICT (user_id) DO UPDATE 
+            SET username = EXCLUDED.username
+            RETURNING (xmax = 0) AS inserted;
+            """,
+            user_id, username, NEW_USER_SUBSCRIPTION_DAYS
+        )
+        if row and row["inserted"]:
+            is_new = True
+
+    # Якщо користувач дійсно новий — надсилаємо сповіщення адміну (винесено за межі пулу з'єднань)
+    if is_new:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🆕 <b>Новий користувач!</b>\n"
+                f"ID: <code>{user_id}</code>\n"
+                f"Username: @{html.escape(username)}",
+                parse_mode=ParseMode.HTML,
             )
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🆕 <b>Новий користувач!</b>\n"
-                    f"ID: <code>{user_id}</code>\n"
-                    f"Username: @{html.escape(username)}",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logging.warning(f"Не вдалося сповістити адміна про нового користувача: {e}")
-        else:
-            # Оновлюємо username на випадок, якщо юзер його змінив
-            await conn.execute(
-                "UPDATE bot_users SET username = $2 WHERE user_id = $1",
-                user_id, username
-            )
+        except Exception as e:
+            logging.warning(f"Не вдалося сповістити адміна про нового користувача: {e}")
 
     await msg.answer(
         "👋 **Вітаю! Я бот для швидкого моніторингу Auto.ria.**\n\n"
@@ -949,8 +962,6 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
     parsed_filters = parse_autoria_url(normalized_url)
     filters_summary = format_filters_summary(parsed_filters)
 
-    # --- Крок 1: ОБОВ'ЯЗКОВО зберігаємо сам фільтр. Це критична дія, яка не повинна
-    #             залежати від того, чи вдасться парсинг оголошень нижче. ---
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -962,30 +973,17 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
                 user_id, normalized_url, json.dumps(parsed_filters, ensure_ascii=False)
             )
     except Exception as e:
-        logging.error(
-            f"Критична помилка збереження фільтра user={user_id} url={normalized_url}: "
-            f"{type(e).__name__}: {e}"
-        )
-        await processing_msg.edit_text(
-            "❌ Не вдалося зберегти фільтр через помилку бази даних. Спробуйте, будь ласка, ще раз трохи пізніше."
-        )
-        return  # без збереженого фільтра йти далі немає сенсу
+        logging.error(f"Критична помилка збереження фільтра user={user_id}: {type(e).__name__}: {e}")
+        await processing_msg.edit_text("❌ Не вдалося зберегти фільтр через помилку бази даних. Спробуйте ще раз пізніше.")
+        return
 
-    # --- Крок 2: намагаємось отримати поточні оголошення для baseline.
-    #             Будь-яка помилка тут НЕ повинна зачіпати вже збережений фільтр. ---
     current_cars = []
     try:
         current_cars = await parse_autoria_smart(http_session, normalized_url)
     except Exception as e:
-        logging.error(
-            f"Помилка парсингу оголошень при додаванні фільтра user={user_id} url={normalized_url}: "
-            f"{type(e).__name__}: {e}"
-        )
+        logging.error(f"Помилка парсингу оголошень для фільтра user={user_id}: {e}")
         current_cars = []
 
-    # --- Крок 3: baseline у sent_cars — теж окрема, некритична дія. Якщо впаде,
-    #             фільтр все одно вже збережено; просто в наступному циклі моніторингу
-    #             користувач може отримати повторно вже наявні на сайті оголошення. ---
     if current_cars:
         try:
             baseline_records = [(user_id, c["car_id"]) for c in current_cars]
@@ -995,44 +993,25 @@ async def _add_single_filter(msg: types.Message, raw_url: str, user_id: int) -> 
                     baseline_records
                 )
         except Exception as e:
-            logging.error(
-                f"Помилка запису baseline sent_cars user={user_id} url={normalized_url}: "
-                f"{type(e).__name__}: {e}"
-            )
+            logging.error(f"Помилка запису baseline sent_cars: {e}")
 
     if current_cars:
         await processing_msg.edit_text(
             f"✅ <b>Фільтр успішно додано!</b>\n\n{html.escape(filters_summary)}\n\n"
             f"📊 Знайдено {len(current_cars)} авто за поточним фільтром — усі вони зафіксовані "
             f"як вже переглянуті (baseline).\n"
-            f"Тепер бот надсилатиме виключно НОВІ оголошення, які з'являться після цього моменту.",
+            f"Тепер бот надсилатиме виключно НОВІ оголошення.",
             parse_mode=ParseMode.HTML
         )
     else:
         await processing_msg.edit_text(
             f"✅ <b>Фільтр додано і збережено!</b>\n\n{html.escape(filters_summary)}\n\n"
-            f"⚠️ Наразі не вдалося отримати список оголошень з Auto.ria (можливе тимчасове "
-            f"блокування). Моніторинг вже запущено — спробуємо знову у наступному циклі.",
+            f"⚠️ Не вдалося отримати список оголошень з Auto.ria. Моніторинг запущено.",
             parse_mode=ParseMode.HTML
         )
 
 
 def _message_has_url(message: types.Message) -> bool:
-    """
-    Безпечна перевірка наявності посилання в тексті АБО підписі повідомлення.
-
-    Навмисно НЕ використовується `F.text.regexp(...) | F.caption.regexp(...)`:
-    оператор `|` у magic_filter (aiogram) НЕ виконує лінивого short-circuit —
-    обидві гілки обчислюються завжди, через `operator.or_`. Для звичайного
-    текстового повідомлення `message.caption` дорівнює None, і виклик
-    `regexp().search(None)` кидає `TypeError: expected string or bytes-like
-    object`. Цей виняток вилітає ще на етапі перевірки фільтра (до хендлера),
-    і оскільки в диспетчері не було `@dp.errors()`, aiogram мовчки "з'їдав"
-    update — бот ігнорував абсолютно будь-яке повідомлення з посиланням.
-
-    Тут звичайна python-функція: жодних regexp-операцій над None, ніяких
-    прихованих крашів. aiogram 3 підтримує plain callable як фільтр напряму.
-    """
     text_content = message.text or message.caption or ""
     return bool(URL_RE.search(text_content))
 
@@ -1056,8 +1035,8 @@ async def add_filter(msg: types.Message):
         try:
             await _add_single_filter(msg, raw_url, user_id)
         except Exception as e:
-            logging.error(f"Помилка додавання фільтра для {user_id}: {type(e).__name__}: {e}")
-            await msg.answer("❌ Сталася помилка при додаванні цього посилання. Спробуйте ще раз пізніше.")
+            logging.error(f"Помилка додавання фільтра для {user_id}: {e}")
+            await msg.answer("❌ Сталася помилка при додаванні цього посилання.")
 
 
 # ============================================================
@@ -1085,7 +1064,6 @@ async def list_users(msg: types.Message):
         lines.append(f"{active} ID: <code>{u['user_id']}</code> | @{uname} | до {expires_str}")
 
     text = "\n".join(lines)
-    # Telegram обмежує повідомлення ~4096 символів — ріжемо на частини за потреби
     for i in range(0, len(text), 4000):
         await msg.answer(text[i:i + 4000], parse_mode=ParseMode.HTML)
 
@@ -1107,18 +1085,12 @@ async def give_sub(msg: types.Message, command: CommandObject):
         return
 
     async with db_pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM bot_users WHERE user_id = $1", target_id)
-        if not exists:
-            await conn.execute(
-                "INSERT INTO bot_users (user_id, subscription_expires) VALUES ($1, NOW())",
-                target_id
-            )
         await conn.execute(
             """
-            UPDATE bot_users
-            SET subscription_expires = GREATEST(COALESCE(subscription_expires, NOW()), NOW())
-                                        + make_interval(days => $2)
-            WHERE user_id = $1
+            INSERT INTO bot_users (user_id, subscription_expires) 
+            VALUES ($1, NOW() + make_interval(days => $2))
+            ON CONFLICT (user_id) DO UPDATE 
+            SET subscription_expires = GREATEST(COALESCE(bot_users.subscription_expires, NOW()), NOW()) + make_interval(days => $2)
             """,
             target_id, days
         )
@@ -1153,7 +1125,7 @@ async def ban_user(msg: types.Message, command: CommandObject):
 
 
 # ============================================================
-#                     ФОНОВИЙ МОНІТОРИНГ
+#                  ФОНОВИЙ МОНІТОРИНГ
 # ============================================================
 
 async def _process_filter(sem: asyncio.Semaphore, record) -> None:
@@ -1199,20 +1171,6 @@ MONITOR_ERROR_COOLDOWN = int(os.getenv("MONITOR_ERROR_COOLDOWN", "120"))
 
 
 async def monitor():
-    """
-    Головний фоновий цикл моніторингу.
-
-    Розрахований на роки безперервної роботи без ручних рестартів: жодна
-    помилка — 403/429 від Auto.ria, таймаут, обрив мережі, збій БД чи будь-
-    який інший неочікуваний виняток — не повинна зупинити цикл назавжди
-    або покласти бота.
-
-    Помилки окремого фільтра (один конкретний URL) вже гасяться всередині
-    _process_filter(). Тут — друга лінія оборони: якщо впаде щось на рівні
-    всього циклу (наприклад, недоступна БД під час SELECT filters, чи будь-
-    який виняток, що якимось чином просочився крізь return_exceptions=True
-    у asyncio.gather), ловимо його тут, логуємо і НЕ даємо циклу померти.
-    """
     while True:
         try:
             async with db_pool.acquire() as conn:
@@ -1223,8 +1181,6 @@ async def monitor():
 
         except Exception as e:
             logging.error(f"Помилка в циклі моніторингу: {e}")
-            # Даємо сайту "віддихатись" довшою паузою, ніж звичайний інтервал,
-            # і одразу йдемо на наступну ітерацію — цикл ніколи не завершується.
             await asyncio.sleep(MONITOR_ERROR_COOLDOWN)
             continue
 
@@ -1241,15 +1197,8 @@ async def monitor_watchdog():
 
 
 # ============================================================
-#                    ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК
+#             ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК
 # ============================================================
-# Раніше в диспетчері не було жодного @dp.errors() — будь-який неочікуваний
-# виняток під час перевірки фільтрів чи виконання хендлера мовчки "з'їдався"
-# aiogram-ом: update вважався обробленим, юзер не отримував жодної відповіді,
-# а в логах не залишалось нічого зрозумілого. Саме так довго ховалась
-# проблема з F.text.regexp(...) | F.caption.regexp(...) на None. Тепер
-# будь-яка подібна помилка гарантовано потрапляє в лог і, за можливості,
-# адміну — а не зникає безслідно.
 
 @dp.errors()
 async def global_error_handler(event: types.ErrorEvent) -> bool:
@@ -1268,9 +1217,9 @@ async def global_error_handler(event: types.ErrorEvent) -> bool:
             parse_mode=ParseMode.HTML,
         )
     except Exception:
-        pass  # якщо навіть сповіщення адміну не вдалось відправити — просто ігноруємо
+        pass
 
-    return True  # позначаємо помилку як оброблену, щоб вона не спливала далі
+    return True
 
 
 # ============================================================
@@ -1288,7 +1237,7 @@ async def main():
     if PROXY_URL:
         logging.info("🌐 Проксі увімкнено для запитів до Auto.ria.")
     else:
-        logging.info("🌐 Проксі не задано (PROXY_URL порожній) — запити йдуть напряму.")
+        logging.info("🌐 Проксі не задано — запити йдуть напряму.")
 
     await bot.delete_webhook(drop_pending_updates=True)
 
